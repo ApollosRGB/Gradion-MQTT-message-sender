@@ -1,0 +1,118 @@
+# Builds the downloadable apps and attaches them to a GitHub release.
+#
+# A macOS .dmg cannot be built on Windows, so the Mac artefacts are built here
+# on GitHub's Mac runners instead of on a developer machine.
+#
+# Runs when a v* tag is pushed, or on demand from the Actions tab.
+
+name: Build release artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the builds to (e.g. v1.3)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows .exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          v=$(python -c 'import re,pathlib; print(re.search(r"APP_VERSION = \"([^\"]+)\"", pathlib.Path("mqtt_trigger_app.py").read_text()).group(1))')
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed `
+            --name "MQTT Trigger" `
+            --collect-all customtkinter `
+            --collect-submodules keyring.backends `
+            --hidden-import keyring.backends.Windows `
+            --hidden-import win32timezone `
+            --hidden-import paho.mqtt.client `
+            --hidden-import cryptography.fernet `
+            --hidden-import cryptography.hazmat.primitives.kdf.pbkdf2 `
+            mqtt_trigger_app.py
+
+      - name: Name the artifact
+        shell: bash
+        run: |
+          mv "dist/MQTT Trigger.exe" "dist/MQTT-Trigger-${{ steps.version.outputs.value }}.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/MQTT-Trigger-*.exe
+
+  macos:
+    name: macOS .dmg (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 runners are Apple Silicon; macos-13 are Intel. A PyInstaller
+          # build only runs on the architecture that produced it, so build both.
+          - runner: macos-14
+            label: Apple Silicon
+          - runner: macos-13
+            label: Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the .app and pack it into a .dmg
+        env:
+          MQTT_TRIGGER_NO_PAUSE: "1"   # never wait for a keypress on CI
+        run: |
+          chmod +x build_dmg.command build_app.command
+          ./build_dmg.command
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg-${{ matrix.runner }}
+          path: dist/MQTT-Trigger-*.dmg
+
+  publish:
+    name: Attach to release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          find artifacts -type f \( -name '*.exe' -o -name '*.dmg' \) -print
+          gh release upload "$TAG" \
+            $(find artifacts -type f \( -name '*.exe' -o -name '*.dmg' \) -print) \
+            --clobber --repo "${{ github.repository }}"

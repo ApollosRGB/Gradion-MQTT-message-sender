@@ -1,0 +1,13 @@
+# Normalise line endings so the repo works from Windows and macOS at once.
+* text=auto
+
+# macOS/Linux shell scripts MUST keep LF - a CR would make bash fail with
+# "command not found" or "bad interpreter" on the very first line.
+*.command text eol=lf
+*.sh      text eol=lf
+
+# Windows batch files need CRLF.
+*.bat     text eol=crlf
+
+# Python is fine either way; keep it LF for consistency across platforms.
+*.py      text eol=lf

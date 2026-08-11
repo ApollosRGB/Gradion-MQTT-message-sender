@@ -1,0 +1,23 @@
+# PyInstaller build output - the apps are published as release assets instead
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local runtime files - these contain your broker details
+config.json
+config.vault
+config.vault.bad
+*.log
+
+# Exported profiles - encrypted, but they still describe a real setup
+*.mqttprofile
+
+# Never commit secrets
+.env
