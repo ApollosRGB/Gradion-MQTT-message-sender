@@ -40,7 +40,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          v=$(python -c 'import re,pathlib; print(re.search(r"APP_VERSION = \"([^\"]+)\"", pathlib.Path("mqtt_trigger_app.py").read_text()).group(1))')
+          v=$(python -c 'import re,pathlib; print(re.search(r"APP_VERSION = \"([^\"]+)\"", pathlib.Path("mqtt_trigger_app.py").read_text(encoding="utf-8")).group(1))')
           echo "value=$v" >> "$GITHUB_OUTPUT"
 
       - name: Build
