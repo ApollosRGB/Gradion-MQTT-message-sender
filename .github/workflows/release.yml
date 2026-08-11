@@ -72,11 +72,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-14 runners are Apple Silicon; macos-13 are Intel. A PyInstaller
-          # build only runs on the architecture that produced it, so build both.
+          # A PyInstaller build only runs on the architecture that produced it,
+          # so build on one runner of each kind. macos-14 is Apple Silicon;
+          # macos-15-intel is the current Intel runner (the old macos-13 label
+          # was retired and jobs asking for it queue forever instead of failing).
           - runner: macos-14
             label: Apple Silicon
-          - runner: macos-13
+          - runner: macos-15-intel
             label: Intel
     runs-on: ${{ matrix.runner }}
     steps:
