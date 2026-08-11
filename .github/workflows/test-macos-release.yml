@@ -92,20 +92,20 @@ jobs:
           echo "--- signature (expected: not signed) ---"
           codesign -dv "$APP" 2>&1 || true
 
-          echo "--- modules that must have been bundled ---"
-          # Pure-Python packages are frozen into PyInstaller's archive rather
-          # than left as files on disk, so look for the module names recorded
-          # in it instead of for directories. Only packages with compiled
-          # extensions (cryptography) appear as real files.
-          MISSING=0
-          for mod in paho.mqtt.client keyring.backends customtkinter cryptography.fernet; do
-            if grep -r -a -l "$mod" "$APP" 2>/dev/null | head -1 | grep -q .; then
-              echo "  present: $mod"
-            else
-              echo "::error::$mod was not bundled"; MISSING=1
-            fi
-          done
-          test "$MISSING" -eq 0
+          # Only packages with compiled extensions leave files of their own -
+          # pure-Python ones (paho, keyring) are frozen into PyInstaller's
+          # archive, which is compressed, so they cannot be checked for by
+          # name. The launch step below is what proves they are present: the
+          # app builds MqttManager (paho), SecretStore (keyring) and
+          # LocalVault (cryptography) while starting, so a missing import
+          # would kill it in the first second.
+          echo "--- compiled dependencies ---"
+          find "$APP" -iname "*cryptography*" -maxdepth 6 | head -3 | grep -q . \
+            || { echo "::error::cryptography was not bundled"; exit 1; }
+          echo "  present: cryptography"
+          find "$APP" -iname "*customtkinter*" -maxdepth 6 | head -3 | grep -q . \
+            || { echo "::error::customtkinter assets were not bundled"; exit 1; }
+          echo "  present: customtkinter assets"
 
       - name: No internal details baked into the app
         run: |
