@@ -92,14 +92,20 @@ jobs:
           echo "--- signature (expected: not signed) ---"
           codesign -dv "$APP" 2>&1 || true
 
-          echo "--- libraries that must have been bundled ---"
-          for lib in cryptography paho customtkinter keyring; do
-            if find "$APP" -iname "*${lib}*" -maxdepth 6 | head -1 | grep -q .; then
-              echo "  present: $lib"
+          echo "--- modules that must have been bundled ---"
+          # Pure-Python packages are frozen into PyInstaller's archive rather
+          # than left as files on disk, so look for the module names recorded
+          # in it instead of for directories. Only packages with compiled
+          # extensions (cryptography) appear as real files.
+          MISSING=0
+          for mod in paho.mqtt.client keyring.backends customtkinter cryptography.fernet; do
+            if grep -r -a -l "$mod" "$APP" 2>/dev/null | head -1 | grep -q .; then
+              echo "  present: $mod"
             else
-              echo "::error::$lib is missing from the bundle"; exit 1
+              echo "::error::$mod was not bundled"; MISSING=1
             fi
           done
+          test "$MISSING" -eq 0
 
       - name: No internal details baked into the app
         run: |
