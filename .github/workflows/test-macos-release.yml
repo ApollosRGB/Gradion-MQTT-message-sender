@@ -1,0 +1,155 @@
+# Smoke-tests a published macOS .dmg on real Mac hardware.
+#
+# Downloads the disk image from a release, mounts it, installs the app the way
+# a user would, launches it and checks it is still alive - so a broken bundle
+# is caught here rather than by whoever downloads it.
+#
+# Run it from the Actions tab: "Smoke-test the macOS release" -> Run workflow.
+
+name: Smoke-test the macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test (e.g. v1.3)"
+        required: true
+        default: "v1.3"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            label: Apple Silicon
+            asset: MQTT-Trigger-*-macOS-arm64.dmg
+            expect_arch: arm64
+          - runner: macos-15-intel
+            label: Intel
+            asset: MQTT-Trigger-*-macOS-x86_64.dmg
+            expect_arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Download the disk image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "${{ matrix.asset }}" \
+            --dir "$RUNNER_TEMP/dmg"
+          ls -lh "$RUNNER_TEMP/dmg"
+
+      - name: Mount it and check the layout
+        run: |
+          set -euo pipefail
+          DMG=$(ls "$RUNNER_TEMP"/dmg/*.dmg)
+          echo "Mounting $(basename "$DMG")"
+          hdiutil attach "$DMG" -mountpoint /Volumes/MQTTTest -nobrowse -readonly
+
+          echo "--- contents of the mounted image ---"
+          ls -la /Volumes/MQTTTest
+
+          # What the user is meant to see: the app, and an Applications
+          # shortcut to drag it onto.
+          test -d "/Volumes/MQTTTest/MQTT Trigger.app" \
+            || { echo "::error::the .dmg has no MQTT Trigger.app in it"; exit 1; }
+          test -L "/Volumes/MQTTTest/Applications" \
+            || { echo "::error::the .dmg has no Applications shortcut to drag onto"; exit 1; }
+          echo "Layout OK - app plus a drag-to-Applications shortcut"
+
+      - name: Install it the way a user would
+        run: |
+          set -euo pipefail
+          cp -R "/Volumes/MQTTTest/MQTT Trigger.app" /Applications/
+          hdiutil detach /Volumes/MQTTTest
+          test -d "/Applications/MQTT Trigger.app"
+          echo "Installed to /Applications"
+
+      - name: Inspect the bundle
+        run: |
+          set -euo pipefail
+          APP="/Applications/MQTT Trigger.app"
+          BIN="$APP/Contents/MacOS/MQTT Trigger"
+
+          test -x "$BIN" || { echo "::error::no executable inside the bundle"; exit 1; }
+
+          echo "--- architecture ---"
+          file "$BIN"
+          file "$BIN" | grep -q "${{ matrix.expect_arch }}" \
+            || { echo "::error::expected a ${{ matrix.expect_arch }} binary"; exit 1; }
+
+          echo "--- Info.plist ---"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$APP/Contents/Info.plist"
+
+          echo "--- signature (expected: not signed) ---"
+          codesign -dv "$APP" 2>&1 || true
+
+          echo "--- libraries that must have been bundled ---"
+          for lib in cryptography paho customtkinter keyring; do
+            if find "$APP" -iname "*${lib}*" -maxdepth 6 | head -1 | grep -q .; then
+              echo "  present: $lib"
+            else
+              echo "::error::$lib is missing from the bundle"; exit 1
+            fi
+          done
+
+      - name: No internal details baked into the app
+        run: |
+          set -uo pipefail
+          APP="/Applications/MQTT Trigger.app"
+          FOUND=0
+          # Anything naming a real broker, tenant or topic must not ship.
+          for needle in synaos openmind robot01 ace.one.stg task-0001; do
+            if grep -r -i -l "$needle" "$APP" 2>/dev/null | head -1 | grep -q .; then
+              echo "::error::'$needle' is present in the shipped app"
+              FOUND=1
+            else
+              echo "  clean: $needle"
+            fi
+          done
+          exit $FOUND
+
+      - name: Launch it and check it stays up
+        run: |
+          set -uo pipefail
+          APP="/Applications/MQTT Trigger.app"
+          xattr -dr com.apple.quarantine "$APP" || true
+
+          open -a "$APP" || { echo "::error::the app would not launch"; exit 1; }
+          sleep 25
+
+          if pgrep -f "MQTT Trigger" >/dev/null; then
+            echo "Still running after 25s:"
+            pgrep -lf "MQTT Trigger" | head -5
+          else
+            echo "::error::the app exited on its own within 25 seconds"
+            echo "--- crash reports ---"
+            ls -la ~/Library/Logs/DiagnosticReports/ 2>/dev/null || true
+            cat ~/Library/Logs/DiagnosticReports/*MQTT*.ips 2>/dev/null | head -60 || true
+            exit 1
+          fi
+
+          # A GUI app that got as far as drawing has a real window.
+          osascript -e 'tell application "System Events" to get name of every process whose background only is false' 2>/dev/null || true
+
+          pkill -f "MQTT Trigger" || true
+          echo "Launch test passed."
+
+      - name: Crash report check
+        if: always()
+        run: |
+          REPORTS=$(ls ~/Library/Logs/DiagnosticReports/*MQTT* 2>/dev/null || true)
+          if [ -n "$REPORTS" ]; then
+            echo "::warning::the app left crash reports behind"
+            for r in $REPORTS; do echo "=== $r ==="; head -40 "$r"; done
+          else
+            echo "No crash reports - clean run."
+          fi
