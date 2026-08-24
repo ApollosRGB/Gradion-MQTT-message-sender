@@ -1,8 +1,14 @@
 # MQTT Trigger
 
-A desktop app for firing saved MQTT messages at a broker on demand — for when
-something goes wrong with a system and you need to push a known command without
-editing a script first.
+A desktop app that does two jobs against one broker connection:
+
+- **Messages** — fire saved MQTT messages on demand, or on a repeating timer,
+  for when something goes wrong with a system and you need to push a known
+  command without editing a script first.
+- **Robot simulator** *(new in 2.0)* — stand in for a robot arm that is not
+  built yet. Each simulated robot waits for a trigger on its own topic, then
+  reports `running`, counts products, and reports `finished` and `stopped` when
+  the trigger goes away.
 
 Runs on **Windows** and **macOS**. Built from the original `mqtt_publisher.py`,
 which is still here and still works.
@@ -17,7 +23,7 @@ which is still here and still works.
 
 ### Windows
 
-Download **`MQTT-Trigger-1.3.exe`** from the
+Download **`MQTT-Trigger-2.0.0.exe`** from the
 [Releases page](https://github.com/ApollosRGB/Gradion-MQTT-message-sender/releases)
 and run it. It is a single self-contained file — the machine running it does
 **not** need Python installed.
@@ -31,8 +37,8 @@ Download the **`.dmg`** for your Mac from the
 
 | Your Mac | File |
 |---|---|
-| Apple Silicon (M1/M2/M3/M4) | `MQTT-Trigger-1.3-macOS-arm64.dmg` |
-| Intel | `MQTT-Trigger-1.3-macOS-x86_64.dmg` |
+| Apple Silicon (M1/M2/M3/M4) | `MQTT-Trigger-2.0.0-macOS-arm64.dmg` |
+| Intel | `MQTT-Trigger-2.0.0-macOS-x86_64.dmg` |
 
 Not sure which you have?  → menu → **About This Mac**. "Apple M…" means Apple
 Silicon.
@@ -77,6 +83,11 @@ you. Their broker settings and saved messages land in your copy of the app.
 Until a broker is set, Connect / Send once / Start loop will tell you so rather
 than failing with a confusing connection error.
 
+Once a broker **is** set, the app connects by itself on launch and subscribes to
+every simulated robot's trigger topic. That matters: a trigger that arrives
+before the app is subscribed is gone, and the robot would sit there looking
+broken.
+
 ---
 
 ## Where your details live, and how they are protected
@@ -87,7 +98,7 @@ account, no telemetry and no sync.
 | What | Where it is kept | How it is protected |
 |---|---|---|
 | Broker password | OS credential vault (Windows Credential Manager / macOS Keychain / Linux Secret Service) | Managed by the OS, under the service name `MQTTTrigger` |
-| Host, username, topics, payloads, theme | `config.vault` in your app-settings folder | Encrypted with AES via Fernet. The key is random per machine and is itself held in the OS credential vault |
+| Host, username, topics, payloads, simulated robots, theme | `config.vault` in your app-settings folder | Encrypted with AES via Fernet. The key is random per machine and is itself held in the OS credential vault |
 | Exported profiles | Wherever you save the `.mqttprofile` file | Encrypted with a passphrase you choose, key derived with PBKDF2-HMAC-SHA256 (480,000 rounds) |
 
 Settings folder:
@@ -117,6 +128,9 @@ once, re-saved encrypted, and then deleted. Nothing is lost.
 
 ## Sharing a setup with a colleague
 
+A profile carries the broker settings, the saved messages **and** the simulated
+robots, so a colleague ends up with the same line laid out the same way.
+
 1. **Profile → Export profile…**
 2. Choose a passphrase (8 characters minimum — it is the only thing protecting
    the file, and there is no recovery if you forget it).
@@ -133,6 +147,13 @@ producing garbage.
 ---
 
 ## Using it
+
+The window has two tabs — **Messages** and **Robot simulator** — sharing one
+broker connection and one log at the bottom.
+
+---
+
+## Messages
 
 **Saved messages** (left panel) — each one holds a name, topic, payload,
 interval, QoS and retain flag.
@@ -170,16 +191,107 @@ it reconnects on its own and carries on.
 
 ---
 
+## Robot simulator
+
+Simulates one or more robot arms reporting to a line controller. The app never
+starts a run on its own: it waits for a trigger message, exactly as a real robot
+would.
+
+### The topics
+
+Each robot has a **base topic**, and the other two follow from it:
+
+| | Topic | Who publishes |
+|---|---|---|
+| Status | `<base>/status` | this app |
+| Trigger | `<base>/cmd/trigger` | you, or the real line controller |
+
+For `Openmind/robot01` that gives `Openmind/robot01/status` and
+`Openmind/robot01/cmd/trigger`. Rename the base topic and both follow it. If
+your line does not lay its topics out that way, type either one in by hand and
+it stays put.
+
+The app ships with **Openmind robot01** and **KUKA robot02** ready to go. Use
+**+ Add** for more — every robot has its own topics, interval and counters, and
+they all run independently.
+
+### What a run looks like
+
+Send `{"trigger": "true"}` to the trigger topic and the robot starts. With the
+interval at 5 seconds:
+
+```
+t=0s    {"state":1,"stateName":"running","goodProduct":0,"badProduct":0,
+         "errorCode":0,"errorName":"","ts":"2026-08-24T14:34:00.680+07:00"}
+t=5s    ... "goodProduct":1 ...
+t=10s   ... "goodProduct":2 ...
+```
+
+Send `{"trigger": "false"}` and it winds down:
+
+```
+at once      {"state":3,"stateName":"finished","goodProduct":2, ...}
+one interval {"state":0,"stateName":"stopped","goodProduct":0,"badProduct":0, ...}
+later
+```
+
+The counters reset with every run, so the next trigger starts again from zero.
+`ts` is this machine's local time with milliseconds and its real UTC offset.
+
+**Trigger payloads** are read leniently — all of these start a run:
+
+```json
+{"trigger": "true"}   {"trigger": true}   {"trigger": 1}   {"trigger": "start"}
+```
+
+so do the bare payloads `true`, `1` and `start`; and `false`, `0`, `off` and
+`stop` stop one. Anything else is logged and ignored rather than guessed at.
+A trigger for a robot that is already running is ignored, and so is a stop for
+one that is not running.
+
+### Driving it without a second tool
+
+**Test the trigger: send true / send false** publishes the trigger for you, to
+the robot's own trigger topic. It comes back through the subscription like any
+other message, so it exercises exactly the path the line controller will.
+
+### Faults
+
+Nothing goes wrong unless you make it. While a robot is running:
+
+- **+1 bad product** — bumps `badProduct` and publishes straight away.
+- **Inject error…** — choose the `state`, `stateName`, `errorCode` and
+  `errorName` to report. Tick **Keep reporting this until I clear it** and every
+  status from then on carries the error (the products keep counting); leave it
+  unticked for a single error message.
+- **Clear error** — back to `running`.
+- **Force stop** — abandons the run *without* the finished and stopped
+  messages. For when you want to simulate a robot that fell off the network.
+
+### Settings
+
+**One product every \_\_ seconds** is the tick rate — it also sets the gap
+between the finished and stopped messages. **QoS** defaults to 1 and **Retain**
+is off; both are per robot. **Save** stores the robot; a robot that is mid-run
+keeps the topic and interval it started with until the next trigger.
+
+Quitting the app abandons any run in progress rather than holding the window
+open for one more interval — nothing further is published.
+
+---
+
 ## Watching what goes out
 
 The bottom half has two tabs:
 
 - **Activity** — every publish, colour-coded: blue `TX` lines with topic, QoS
-  and the exact payload sent; red `FAIL` lines with the reason; grey notes for
-  loops starting and stopping.
-- **Debug** — connection events, CONNACK results, TLS settings in use, client
-  ID, reconnect warnings, and whether encryption at rest is active. This is the
-  tab to look at when a connection won't come up.
+  and the exact payload sent; purple `RX` lines for triggers arriving; red
+  `FAIL` lines with the reason; grey notes for loops and simulations starting
+  and stopping.
+- **Debug** — connection events, CONNACK results, `SUB` / `UNSUB` lines for the
+  trigger topics, TLS settings in use, client ID, reconnect warnings, and
+  whether encryption at rest is active. This is the tab to look at when a
+  connection won't come up, or when a trigger you sent never arrived.
 
 **Auto-scroll** keeps the newest line in view; **Export log…** writes the
 current tab to a `.log` file; **Clear** empties it. The view holds the last
@@ -237,7 +349,11 @@ Launchers: `Run_MQTT_Publisher.bat` (Windows), `Run_MQTT_Publisher.command` (mac
 
 ## Notes
 
-- Closing the window while loops are running asks for confirmation first.
+- Closing the window while loops or simulations are running asks for
+  confirmation first.
+- If the connection drops, the app reconnects and re-subscribes to the trigger
+  topics on its own — a dropped session otherwise loses its subscriptions
+  silently.
 - Changing broker settings while loops are running stops them, reconnects with
   the new settings, and restarts them.
 - Custom icon: drop an `icon.ico` (Windows) or `icon.icns` (macOS) next to the
