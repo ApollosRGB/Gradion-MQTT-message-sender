@@ -23,7 +23,7 @@ which is still here and still works.
 
 ### Windows
 
-Download **`MQTT-Trigger-2.0.0.exe`** from the
+Download **`MQTT-Trigger-2.1.0.exe`** from the
 [Releases page](https://github.com/ApollosRGB/Gradion-MQTT-message-sender/releases)
 and run it. It is a single self-contained file — the machine running it does
 **not** need Python installed.
@@ -37,8 +37,8 @@ Download the **`.dmg`** for your Mac from the
 
 | Your Mac | File |
 |---|---|
-| Apple Silicon (M1/M2/M3/M4) | `MQTT-Trigger-2.0.0-macOS-arm64.dmg` |
-| Intel | `MQTT-Trigger-2.0.0-macOS-x86_64.dmg` |
+| Apple Silicon (M1/M2/M3/M4) | `MQTT-Trigger-2.1.0-macOS-arm64.dmg` |
+| Intel | `MQTT-Trigger-2.1.0-macOS-x86_64.dmg` |
 
 Not sure which you have?  → menu → **About This Mac**. "Apple M…" means Apple
 Silicon.
@@ -227,33 +227,40 @@ t=5s    ... "goodProduct":1 ...
 t=10s   ... "goodProduct":2 ...
 ```
 
-Send `{"trigger": "false"}` and it winds down:
+Send `false` and it winds down. How long it sits on `finished` is its own
+setting — **not** the product interval — so a line that ticks every second can
+still take ten to clear down:
 
 ```
-at once      {"state":3,"stateName":"finished","goodProduct":2, ...}
-one interval {"state":0,"stateName":"stopped","goodProduct":0,"badProduct":0, ...}
+at once        {"state":3,"stateName":"finished","goodProduct":2, ...}
+stopped delay  {"state":0,"stateName":"stopped","goodProduct":0,"badProduct":0, ...}
 later
 ```
+
+Set that delay to `0` and `stopped` follows `finished` immediately.
 
 The counters reset with every run, so the next trigger starts again from zero.
 `ts` is this machine's local time with milliseconds and its real UTC offset.
 
-**Trigger payloads** are read leniently — all of these start a run:
+**Trigger payloads** are read leniently. The plain word on its own is the
+normal case — `true` starts a run, `false` ends one — and these all work too:
 
 ```json
 {"trigger": "true"}   {"trigger": true}   {"trigger": 1}   {"trigger": "start"}
 ```
 
-so do the bare payloads `true`, `1` and `start`; and `false`, `0`, `off` and
-`stop` stop one. Anything else is logged and ignored rather than guessed at.
+Bare `1`, `start`, `on` also start; `0`, `off` and `stop` also stop. Case does
+not matter, so `False` from a Python publisher is read the same as `false`. Anything else is logged and ignored rather than guessed at.
 A trigger for a robot that is already running is ignored, and so is a stop for
 one that is not running.
 
 ### Driving it without a second tool
 
 **Test the trigger: send true / send false** publishes the trigger for you, to
-the robot's own trigger topic. It comes back through the subscription like any
-other message, so it exercises exactly the path the line controller will.
+the robot's own trigger topic. It goes out as the bare word — `true` or
+`false`, no JSON wrapper — which is what the line controller puts on the topic.
+It comes back through the subscription like any other message, so it exercises
+exactly the path the controller will.
 
 ### Faults
 
@@ -270,9 +277,11 @@ Nothing goes wrong unless you make it. While a robot is running:
 
 ### Settings
 
-**One product every \_\_ seconds** is the tick rate — it also sets the gap
-between the finished and stopped messages. **QoS** defaults to 1 and **Retain**
-is off; both are per robot. **Save** stores the robot; a robot that is mid-run
+**One product every \_\_ seconds** is the tick rate. **Stopped message \_\_
+seconds after finished** is separate from it — the two answer different
+questions, so changing how fast products come off the line does not change how
+long the robot sits on `finished`. **QoS** defaults to 1 and **Retain** is off;
+all four are per robot. **Save** stores the robot; a robot that is mid-run
 keeps the topic and interval it started with until the next trigger.
 
 Quitting the app abandons any run in progress rather than holding the window

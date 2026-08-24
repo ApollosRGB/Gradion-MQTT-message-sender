@@ -69,7 +69,7 @@ import paho.mqtt.client as mqtt
 # ============================================================================
 
 APP_NAME = "MQTT Trigger"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 KEYRING_SERVICE = "MQTTTrigger"
 
 # Credential-vault account name for the random key that encrypts the settings
@@ -155,7 +155,8 @@ STATUS_SUFFIX = "/status"
 TRIGGER_SUFFIX = "/cmd/trigger"
 
 SIM_DEFAULT_INTERVAL = 5.0
-SIM_TRIGGER_QOS = 1          # QoS the trigger topics are subscribed at
+SIM_DEFAULT_STOP_DELAY = 5.0   # finished -> stopped, independent of the tick rate
+SIM_TRIGGER_QOS = 1            # QoS the trigger topics are subscribed at
 
 # Payload words accepted on a trigger topic, on top of JSON true / false.
 TRIGGER_TRUE_WORDS = {"true", "1", "on", "start", "yes", "run", "running", "go"}
@@ -517,6 +518,7 @@ class Robot:
     status_topic: str = ""
     trigger_topic: str = ""
     interval: float = SIM_DEFAULT_INTERVAL
+    stop_delay: float = SIM_DEFAULT_STOP_DELAY
     qos: int = 1
     retain: bool = False
 
@@ -545,6 +547,12 @@ class Robot:
         except (TypeError, ValueError):
             r.interval = SIM_DEFAULT_INTERVAL
         try:
+            # Robots saved by 2.0 have no stop delay of their own - it was the
+            # tick interval back then, so keep them behaving as they did.
+            r.stop_delay = max(0.0, float(data.get("stop_delay", r.interval)))
+        except (TypeError, ValueError):
+            r.stop_delay = r.interval
+        try:
             r.qos = int(data.get("qos", 1))
         except (TypeError, ValueError):
             r.qos = 1
@@ -556,7 +564,8 @@ class Robot:
         return {
             "id": self.id, "name": self.name, "base_topic": self.base_topic,
             "status_topic": self.status_topic, "trigger_topic": self.trigger_topic,
-            "interval": self.interval, "qos": self.qos, "retain": self.retain,
+            "interval": self.interval, "stop_delay": self.stop_delay,
+            "qos": self.qos, "retain": self.retain,
         }
 
 
@@ -1002,6 +1011,7 @@ class RobotRunner(threading.Thread):
         self.label = robot.name
         self.topic = robot.resolved_status
         self.interval = max(MIN_INTERVAL_S, float(robot.interval))
+        self.stop_delay = max(0.0, float(robot.stop_delay))
         self.qos = robot.qos
         self.retain = robot.retain
         self._manager = manager
@@ -1064,9 +1074,11 @@ class RobotRunner(threading.Thread):
             self._publish(*STATE_RUNNING)
 
         if not self._kill.is_set():
-            self._set_phase("finishing")
-            self._publish(*STATE_FINISHED)     # carries the final count
-            self._kill.wait(self.interval)     # one interval, then the reset
+            self.phase = "finishing"
+            self._put("sim_phase", phase="finishing",
+                      next_at=time.monotonic() + self.stop_delay)
+            self._publish(*STATE_FINISHED)      # carries the final count
+            self._kill.wait(self.stop_delay)    # its own delay, then the reset
             if not self._kill.is_set():
                 self._publish(*STATE_STOPPED, good=0, bad=0)
 
@@ -1880,6 +1892,16 @@ class App(ctk.CTk):
                                                 command=self._mark_sim_dirty)
         self.sim_retain_check.grid(row=0, column=6)
 
+        # Kept apart from the tick rate: how fast products come off the line
+        # and how long the robot sits on "finished" are different things.
+        ctk.CTkLabel(opts, text="Stopped message").grid(
+            row=1, column=0, padx=(0, 8), pady=(10, 0))
+        self.sim_stop_entry = ctk.CTkEntry(opts, width=80, justify="right")
+        self.sim_stop_entry.grid(row=1, column=1, pady=(10, 0))
+        self.sim_stop_entry.bind("<KeyRelease>", self._mark_sim_dirty)
+        ctk.CTkLabel(opts, text="seconds after finished", anchor="w").grid(
+            row=1, column=2, columnspan=2, padx=(6, 10), pady=(10, 0), sticky="w")
+
         # ---- live panel ------------------------------------------------
         live = ctk.CTkFrame(right)
         live.grid(row=6, column=0, columnspan=2, padx=16, pady=(4, 8), sticky="nsew")
@@ -2336,6 +2358,8 @@ class App(ctk.CTk):
         self.sim_trigger_entry.insert(0, robot.resolved_trigger)
         self.sim_interval_entry.delete(0, "end")
         self.sim_interval_entry.insert(0, self._format_interval(robot.interval))
+        self.sim_stop_entry.delete(0, "end")
+        self.sim_stop_entry.insert(0, self._format_interval(robot.stop_delay))
         self.sim_qos_menu.set(str(robot.qos))
         if robot.retain:
             self.sim_retain_check.select()
@@ -2410,8 +2434,21 @@ class App(ctk.CTk):
                 APP_NAME, f"Interval must be at least {MIN_INTERVAL_S} seconds.", parent=self)
             return None
 
+        raw_delay = self.sim_stop_entry.get().strip().replace(",", ".")
+        try:
+            stop_delay = float(raw_delay)
+        except ValueError:
+            messagebox.showwarning(
+                APP_NAME, f"'{raw_delay}' is not a valid number of seconds.", parent=self)
+            return None
+        if stop_delay < 0:
+            messagebox.showwarning(
+                APP_NAME, "The stopped delay cannot be negative. Use 0 to send stopped "
+                          "straight after finished.", parent=self)
+            return None
+
         edited = Robot(id=robot.id, name=name, base_topic=base, status_topic=status,
-                       trigger_topic=trigger, interval=interval,
+                       trigger_topic=trigger, interval=interval, stop_delay=stop_delay,
                        qos=int(self.sim_qos_menu.get()),
                        retain=bool(self.sim_retain_check.get()))
 
@@ -2480,7 +2517,8 @@ class App(ctk.CTk):
             return
         copy = Robot(name=f"{source.name} (copy)", base_topic=source.base_topic,
                      status_topic=source.status_topic, trigger_topic=source.trigger_topic,
-                     interval=source.interval, qos=source.qos, retain=source.retain)
+                     interval=source.interval, stop_delay=source.stop_delay,
+                     qos=source.qos, retain=source.retain)
         self.config_data.robots.insert(self.config_data.robots.index(source) + 1, copy)
         self.config_data.save()
         self._sim_dirty = False
@@ -2566,7 +2604,7 @@ class App(ctk.CTk):
         if not silent:
             self.log("activity", "info",
                      f"[{robot.name}] STOP - finished now, stopped in "
-                     f"{self._format_interval(runner.interval)}s")
+                     f"{self._format_interval(runner.stop_delay)}s")
 
     def _sim_stop_all(self, kill: bool = False, silent: bool = False) -> None:
         if not self.sim_runners:
@@ -2618,8 +2656,9 @@ class App(ctk.CTk):
     def _send_test_trigger(self, value: bool) -> None:
         """Publish a trigger to the robot's own trigger topic.
 
-        It comes back through the subscription like any other trigger, so this
-        exercises the same path a real line controller would.
+        Sent as a bare true / false, which is what the line controller puts on
+        the topic. It comes back through the subscription like any other
+        trigger, so this exercises the same path the controller does.
         """
         if not self._require_broker():
             return
@@ -2628,7 +2667,7 @@ class App(ctk.CTk):
         robot = self.config_data.find_robot(self.selected_robot_id)
         if robot is None or not robot.resolved_trigger:
             return
-        payload = json.dumps({"trigger": "true" if value else "false"})
+        payload = "true" if value else "false"
         self._publish_async(robot.resolved_trigger, payload, qos=SIM_TRIGGER_QOS,
                             label=f"{robot.name} test trigger")
 
@@ -2670,7 +2709,8 @@ class App(ctk.CTk):
         if wanted is None:
             self.log("activity", "warn",
                      f"Trigger payload on {topic} not understood - ignored. "
-                     f"Expected something like {{\"trigger\": \"true\"}}.")
+                     f"Expected true or false, bare or as "
+                     f"{{\"trigger\": \"true\"}}.")
             return
 
         for robot in watchers:
@@ -2701,8 +2741,11 @@ class App(ctk.CTk):
         fault = runner.fault
 
         if phase == "finishing":
+            next_at = state.get("next_at")
+            remaining = max(0.0, next_at - time.monotonic()) if next_at else 0.0
             self.sim_phase_label.configure(
-                text="■  Finished - stopped message next", text_color="#e8590c")
+                text=f"■  Finished - stopped message in {remaining:0.0f}s",
+                text_color="#e8590c")
         elif phase == "starting":
             self.sim_phase_label.configure(text="Starting...", text_color="#e8590c")
         elif fault:
