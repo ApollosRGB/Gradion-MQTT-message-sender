@@ -23,7 +23,7 @@ which is still here and still works.
 
 ### Windows
 
-Download **`MQTT-Trigger-2.1.0.exe`** from the
+Download **`MQTT-Trigger-2.2.0.exe`** from the
 [Releases page](https://github.com/ApollosRGB/Gradion-MQTT-message-sender/releases)
 and run it. It is a single self-contained file — the machine running it does
 **not** need Python installed.
@@ -37,8 +37,8 @@ Download the **`.dmg`** for your Mac from the
 
 | Your Mac | File |
 |---|---|
-| Apple Silicon (M1/M2/M3/M4) | `MQTT-Trigger-2.1.0-macOS-arm64.dmg` |
-| Intel | `MQTT-Trigger-2.1.0-macOS-x86_64.dmg` |
+| Apple Silicon (M1/M2/M3/M4) | `MQTT-Trigger-2.2.0-macOS-arm64.dmg` |
+| Intel | `MQTT-Trigger-2.2.0-macOS-x86_64.dmg` |
 
 Not sure which you have?  → menu → **About This Mac**. "Apple M…" means Apple
 Silicon.
@@ -167,9 +167,16 @@ interval, QoS and retain flag.
 
 **Editing** — change the fields on the right and press **Save**
 (`Ctrl+S`, or `Cmd+S` on macOS). The Save button shows `Save *` while you have
-unsaved changes. The badge above the payload box tells you live whether it is
-valid JSON, and **Format JSON** tidies up the indentation. Non-JSON payloads are
-allowed — you just get a confirmation prompt.
+unsaved changes.
+
+The badge above the payload box says what it is holding. **valid JSON** for an
+object or an array, which **Format JSON** will tidy the indentation of, and
+**raw text — sent as typed** for everything else. Raw is a payload in its own
+right, not a mistake: a payload of `True` puts the five characters `True` on the
+topic, which is exactly what a trigger topic carries. The **True** and **False**
+buttons next to the badge fill the box with those words in one click. Only a
+payload that opens with `{` or `[` and then fails to parse is flagged, and that
+is the only case that asks you to confirm on save.
 
 **Sending**
 

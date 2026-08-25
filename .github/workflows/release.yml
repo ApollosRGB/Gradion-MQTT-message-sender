@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to attach the builds to (e.g. v2.1.0)"
+        description: "Existing release tag to attach the builds to (e.g. v2.2.0)"
         required: true
 
 permissions:

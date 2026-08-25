@@ -69,7 +69,7 @@ import paho.mqtt.client as mqtt
 # ============================================================================
 
 APP_NAME = "MQTT Trigger"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 KEYRING_SERVICE = "MQTTTrigger"
 
 # Credential-vault account name for the random key that encrypts the settings
@@ -128,6 +128,14 @@ DEFAULT_TOPIC = "example/device/cmd"
 DEFAULT_PAYLOAD = json.dumps(
     {"command": "example", "value": 1}, indent=2
 )
+
+# A payload starting with one of these is meant to be JSON, so failing to parse
+# is an error. Everything else is raw text and is sent exactly as typed.
+JSON_OPENERS = "{["
+
+# One-click payloads for the message editor - the bare words a trigger topic
+# carries, with no JSON wrapper around them.
+RAW_QUICK_PAYLOADS = ("True", "False")
 
 MIN_INTERVAL_S = 0.1
 MAX_LOG_LINES = 2000
@@ -435,6 +443,34 @@ def _coerce_trigger(value) -> bool | None:
         if word in TRIGGER_FALSE_WORDS:
             return False
     return None
+
+
+def classify_payload(text: str) -> tuple[str, str]:
+    """Say what is in a payload box, and give the user a line about it.
+
+    A payload is bytes on a topic, not a JSON document. A bare True or False is
+    exactly what a line controller puts on a trigger topic, so raw text is a
+    first-class payload here and is published character for character. Only
+    text that opens like JSON and then fails to parse is a mistake worth
+    flagging - anything else is taken at its word.
+
+    Returns one of "empty" / "broken" / "raw" / "json" with a short detail.
+    """
+    if not text:
+        return "empty", "empty payload"
+    try:
+        parsed = json.loads(text)
+    except ValueError as exc:
+        if text[:1] in JSON_OPENERS:
+            line = getattr(exc, "lineno", None)
+            where = f" - line {line}: {exc.msg}" if line else f" - {exc}"
+            return "broken", f"not valid JSON{where}"
+        return "raw", "raw text - sent as typed"
+    if isinstance(parsed, (dict, list)):
+        return "json", "valid JSON"
+    # true / false / 42 / "word" - valid JSON, but on the wire it is the same
+    # bare token the reader sees either way, so call it what it is.
+    return "raw", "raw value - sent as typed"
 
 
 def parse_trigger(payload: str) -> bool | None:
@@ -1750,9 +1786,17 @@ class App(ctk.CTk):
         self.json_status = ctk.CTkLabel(payload_head, text="", anchor="e",
                                         font=ctk.CTkFont(size=12))
         self.json_status.grid(row=0, column=1, sticky="e", padx=8)
+        # A trigger topic carries the bare word, not a JSON wrapper - one click
+        # to put exactly that in the box.
+        for i, word in enumerate(RAW_QUICK_PAYLOADS):
+            ctk.CTkButton(payload_head, text=word, width=62, height=26,
+                          fg_color="transparent", border_width=1,
+                          command=lambda w=word: self._set_raw_payload(w)).grid(
+                row=0, column=2 + i, padx=(0, 6))
         ctk.CTkButton(payload_head, text="Format JSON", width=110, height=26,
                       fg_color="transparent", border_width=1,
-                      command=self._format_json).grid(row=0, column=2)
+                      command=self._format_json).grid(
+            row=0, column=2 + len(RAW_QUICK_PAYLOADS))
 
         self.payload_box = ctk.CTkTextbox(right, font=ctk.CTkFont(family=MONO_FONT, size=13),
                                           wrap="none", undo=True)
@@ -2133,7 +2177,7 @@ class App(ctk.CTk):
         self.config_data.last_selected = preset_id
         self._dirty = False
         self.save_btn.configure(text="Save")
-        self._validate_json()
+        self._check_payload()
         self._refresh_preset_list()
         self._update_action_buttons()
 
@@ -2147,24 +2191,27 @@ class App(ctk.CTk):
 
     def _on_payload_change(self, _event=None) -> None:
         self._mark_dirty()
-        self._validate_json()
+        self._check_payload()
 
-    def _validate_json(self) -> bool:
-        text = self.payload_box.get("1.0", "end").strip()
-        if not text:
-            self.json_status.configure(text="empty payload", text_color="#e8590c")
-            return False
-        try:
-            json.loads(text)
-        except json.JSONDecodeError as exc:
-            self.json_status.configure(text=f"not valid JSON - line {exc.lineno}: {exc.msg}",
-                                       text_color="#e8590c")
-            return False
-        self.json_status.configure(text="valid JSON", text_color="#2f9e44")
-        return True
+    def _check_payload(self) -> str:
+        """Label what is in the payload box. Returns the kind - see classify_payload."""
+        kind, detail = classify_payload(self.payload_box.get("1.0", "end").strip())
+        colour = {"json": "#2f9e44", "raw": ("#5c6f8a", "#8fa6c4")}.get(kind, "#e8590c")
+        self.json_status.configure(text=detail, text_color=colour)
+        return kind
+
+    def _set_raw_payload(self, word: str) -> None:
+        """Drop a bare word into the payload box, replacing whatever is there."""
+        self.payload_box.delete("1.0", "end")
+        self.payload_box.insert("1.0", word)
+        self._on_payload_change()
 
     def _format_json(self) -> None:
         text = self.payload_box.get("1.0", "end").strip()
+        if text[:1] not in JSON_OPENERS:
+            messagebox.showinfo(APP_NAME, "Nothing to format - this payload is raw text "
+                                          "and is sent exactly as typed.", parent=self)
+            return
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -2222,10 +2269,13 @@ class App(ctk.CTk):
         if edited is None:
             return False
 
-        if not self._validate_json():
+        # Raw text is a payload, not a failed attempt at JSON - only ask about
+        # something that opens like JSON and then does not parse.
+        if self._check_payload() == "broken":
             proceed = messagebox.askyesno(
                 APP_NAME,
-                "The payload is not valid JSON. Save and send it as raw text anyway?",
+                "The payload opens like JSON but does not parse. "
+                "Save and send it as raw text anyway?",
                 parent=self)
             if not proceed:
                 return False
