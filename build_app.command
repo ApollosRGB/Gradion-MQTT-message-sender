@@ -107,7 +107,7 @@ echo
 }
 
 # --- Zip the bundle for distribution -------------------------------------
-VERSION=$("$PY" -c 'import re,pathlib; print(re.search(r"APP_VERSION = \"([^\"]+)\"", pathlib.Path("mqtt_trigger_app.py").read_text(encoding="utf-8")).group(1))' 2>/dev/null || echo "2.2.0")
+VERSION=$("$PY" -c 'import re,pathlib; print(re.search(r"APP_VERSION = \"([^\"]+)\"", pathlib.Path("mqtt_trigger_app.py").read_text(encoding="utf-8")).group(1))' 2>/dev/null || echo "2.3.0")
 ARCH=$(uname -m)
 ZIP_NAME="MQTT-Trigger-${VERSION}-macOS-${ARCH}.zip"
 

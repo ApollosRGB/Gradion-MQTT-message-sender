@@ -1,6 +1,6 @@
 # MQTT Trigger
 
-A desktop app that does two jobs against one broker connection:
+A desktop app that does three jobs against one broker connection:
 
 - **Messages** — fire saved MQTT messages on demand, or on a repeating timer,
   for when something goes wrong with a system and you need to push a known
@@ -9,6 +9,9 @@ A desktop app that does two jobs against one broker connection:
   built yet. Each simulated robot waits for a trigger on its own topic, then
   reports `running`, counts products, and reports `finished` and `stopped` when
   the trigger goes away.
+- **Topic monitor** *(new in 2.3)* — point it at a topic and it keeps every
+  update that arrives there, so an AGV reporting for itself can be checked here
+  rather than in a second tool alongside this one.
 
 Runs on **Windows** and **macOS**. Built from the original `mqtt_publisher.py`,
 which is still here and still works.
@@ -98,7 +101,7 @@ account, no telemetry and no sync.
 | What | Where it is kept | How it is protected |
 |---|---|---|
 | Broker password | OS credential vault (Windows Credential Manager / macOS Keychain / Linux Secret Service) | Managed by the OS, under the service name `MQTTTrigger` |
-| Host, username, topics, payloads, simulated robots, theme | `config.vault` in your app-settings folder | Encrypted with AES via Fernet. The key is random per machine and is itself held in the OS credential vault |
+| Host, username, topics, payloads, simulated robots, watched topics, theme | `config.vault` in your app-settings folder | Encrypted with AES via Fernet. The key is random per machine and is itself held in the OS credential vault |
 | Exported profiles | Wherever you save the `.mqttprofile` file | Encrypted with a passphrase you choose, key derived with PBKDF2-HMAC-SHA256 (480,000 rounds) |
 
 Settings folder:
@@ -128,8 +131,10 @@ once, re-saved encrypted, and then deleted. Nothing is lost.
 
 ## Sharing a setup with a colleague
 
-A profile carries the broker settings, the saved messages **and** the simulated
-robots, so a colleague ends up with the same line laid out the same way.
+A profile carries the broker settings, the saved messages, the simulated
+robots **and** the watched topics, so a colleague ends up with the same line
+laid out the same way. Caught messages are not in it — those are a recording of
+your session, not a setting.
 
 1. **Profile → Export profile…**
 2. Choose a passphrase (8 characters minimum — it is the only thing protecting
@@ -148,8 +153,8 @@ producing garbage.
 
 ## Using it
 
-The window has two tabs — **Messages** and **Robot simulator** — sharing one
-broker connection and one log at the bottom.
+The window has three tabs — **Messages**, **Robot simulator** and **Topic
+monitor** — sharing one broker connection and one log at the bottom.
 
 ---
 
@@ -296,6 +301,88 @@ open for one more interval — nothing further is published.
 
 ---
 
+## Topic monitor
+
+*New in 2.3.* The other two tabs are about what you send. This one is about
+what comes back — an AGV, a PLC, a robot that is already real, anything that
+reports for itself. Give it a topic and every update published there is kept,
+laid out and exportable, with no second tool open beside this one.
+
+### Watching a topic
+
+**Watched topics** (left panel) — each entry holds a name, a topic, a QoS and
+whether it is currently watching. **+ Add** makes one, **Duplicate** copies the
+selected one, **Delete** removes it, and **Clear caught** empties the buffer
+without touching the list.
+
+Fill in **Topic**, tick **Watching**, press **Save**. The subscription goes out
+straight away when the app is connected, and on the next connection otherwise —
+so a watch set up before the broker is reachable still works once it is.
+
+Wildcards are the point of this, not an extra:
+
+| Topic | Catches |
+|---|---|
+| `agv/01/state` | that one topic |
+| `agv/+/state` | the state of every AGV, one level down |
+| `agv/#` | everything published anywhere under `agv` |
+
+`#` has to be the last level, `+` has to fill a whole level, and neither may sit
+next to other characters — the app says which rule a topic breaks rather than
+sending a subscription the broker will reject. Untick **Watching** to stop a
+watch without losing it; the entry stays, and the subscription is dropped.
+
+Watching costs nothing on the publishing side: the trigger topics the simulator
+needs and the topics you are watching are merged into one subscription list, at
+the higher QoS wherever they overlap.
+
+### Reading what arrived
+
+The feed underneath is one line per message — time, `[R]` if the broker sent it
+as a retained message, topic, then the payload flattened onto one line. Click a
+line and the panel at the bottom shows that message in full: topic, QoS,
+retained or not, the timestamp it was caught at, and the payload laid out as
+JSON when it is JSON, or exactly as it arrived when it is not.
+
+- **Follow latest** (ticked by default) keeps the newest message selected and in
+  view. Clicking a line unticks it, because you are reading that one now — tick
+  it again to go back to following.
+- **Filter** narrows the feed to messages whose topic or payload contains what
+  you type. It filters the view, not the buffer; clearing it brings everything
+  back.
+- **Pause** stops keeping messages. The subscription stays up — pausing means
+  "stop filling the buffer", not "stop listening" — so ticking it again picks
+  up from whatever arrives next.
+- **Copy payload** puts the selected payload on the clipboard, formatted the way
+  the panel shows it.
+- **Export…** writes what the feed currently shows — so the filter applies — to
+  `.json` (one object per message, with sequence number, timestamp, topic, QoS,
+  retain flag and payload) or `.csv` (the same, one row per message). The file
+  extension you choose decides the format.
+
+The buffer holds the last 2000 messages; older ones fall off the end. A count
+next to each watch shows how many messages it has caught.
+
+### From a script
+
+The tab is a front end for one method, so anything driving the app can watch a
+topic the same way:
+
+```python
+app.watch_topic("agv/+/state", qos=1, name="AGV fleet")
+
+app.latest("agv/01/state").payload     # the last update from that AGV
+app.captured("agv/#")                  # everything caught below agv/, oldest first
+app.unwatch_topic("agv/+/state")       # stop, keeping what was caught
+```
+
+`watch_topic` subscribes, saves the watch so it comes back next launch, and
+returns it. Asking for a topic that is already watched re-enables it and raises
+its QoS if needed rather than adding a second copy. It returns `None`, and says
+why in the log, for a topic no broker would accept.
+
+---
+
 ## Watching what goes out
 
 The bottom half has two tabs:
@@ -303,9 +390,13 @@ The bottom half has two tabs:
 - **Activity** — every publish, colour-coded: blue `TX` lines with topic, QoS
   and the exact payload sent; purple `RX` lines for triggers arriving; red
   `FAIL` lines with the reason; grey notes for loops and simulations starting
-  and stopping.
+  and stopping. Messages caught by a watch do **not** get a line each — a
+  device publishing ten times a second would bury everything else — so the
+  first sighting of each topic is noted here and the rest go to the Topic
+  monitor.
 - **Debug** — connection events, CONNACK results, `SUB` / `UNSUB` lines for the
-  trigger topics, TLS settings in use, client ID, reconnect warnings, and
+  trigger and watched topics, TLS settings in use, client ID, reconnect
+  warnings, and
   whether encryption at rest is active. This is the tab to look at when a
   connection won't come up, or when a trigger you sent never arrived.
 
@@ -313,8 +404,9 @@ The bottom half has two tabs:
 current tab to a `.log` file; **Clear** empties it. The view holds the last
 2000 lines.
 
-Exported logs contain the topics and payloads you sent — treat them the same way
-you would treat the settings.
+Exported logs contain the topics and payloads you sent, and exported captures
+contain what your devices published — treat both the same way you would treat
+the settings.
 
 ---
 
@@ -368,8 +460,8 @@ Launchers: `Run_MQTT_Publisher.bat` (Windows), `Run_MQTT_Publisher.command` (mac
 - Closing the window while loops or simulations are running asks for
   confirmation first.
 - If the connection drops, the app reconnects and re-subscribes to the trigger
-  topics on its own — a dropped session otherwise loses its subscriptions
-  silently.
+  and watched topics on its own — a dropped session otherwise loses its
+  subscriptions silently.
 - Changing broker settings while loops are running stops them, reconnects with
   the new settings, and restarts them.
 - Custom icon: drop an `icon.ico` (Windows) or `icon.icns` (macOS) next to the

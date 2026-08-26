@@ -15,6 +15,9 @@ Features
   * Live view       - Activity tab shows every publish; Debug tab shows
                       connection events and raw MQTT logging.
   * Interval control- change the seconds between messages per preset, live.
+  * Topic monitor   - watch any topic (wildcards allowed) and keep every
+                      update that arrives, to read, filter and export. See
+                      App.watch_topic().
   * Light / dark    - System, Light or Dark, remembered between launches.
   * Credentials     - broker password is kept in the OS credential vault
                       (via keyring), never in a file.
@@ -48,6 +51,7 @@ Build:       build_exe.bat      (Windows -> .exe)
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import queue
@@ -56,6 +60,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -69,7 +74,7 @@ import paho.mqtt.client as mqtt
 # ============================================================================
 
 APP_NAME = "MQTT Trigger"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 KEYRING_SERVICE = "MQTTTrigger"
 
 # Credential-vault account name for the random key that encrypts the settings
@@ -141,9 +146,10 @@ MIN_INTERVAL_S = 0.1
 MAX_LOG_LINES = 2000
 CONNECT_TIMEOUT_S = 15
 
-# The two top-level screens.
+# The three top-level screens.
 TAB_MESSAGES = "Messages"
 TAB_SIMULATOR = "Robot simulator"
+TAB_MONITOR = "Topic monitor"
 
 # ---------------------------------------------------------------------------
 # Robot simulator
@@ -180,6 +186,25 @@ DEFAULT_ROBOTS = [
     ("Openmind robot01", "Openmind/robot01"),
     ("KUKA robot02", "kuka/robot02"),
 ]
+
+# ---------------------------------------------------------------------------
+# Topic monitor
+#
+# A watch subscribes to one topic filter and keeps everything that arrives on
+# it, so an AGV - or any other device that reports for itself - can be checked
+# from here rather than from a second tool open beside this one. The MQTT
+# wildcards are allowed: `+` stands for one level, `#` for the rest, so a
+# single watch can cover a whole fleet.
+# ---------------------------------------------------------------------------
+
+DEFAULT_WATCH_TOPIC = "example/agv/#"
+MONITOR_DEFAULT_QOS = 1
+MONITOR_MAX_MESSAGES = 2000    # ring buffer - the oldest fall off the end
+MONITOR_LINE_LIMIT = 400       # payload characters shown on one feed line
+
+# Watches the app starts life with. Like the robots, these are example topics
+# and imply no broker, tenant or device of anyone's.
+DEFAULT_WATCHES = [("AGV updates", DEFAULT_WATCH_TOPIC)]
 
 # Log colours, per appearance mode. tag_config takes a single colour, so these
 # get re-applied whenever the theme changes.
@@ -497,6 +522,53 @@ def parse_trigger(payload: str) -> bool | None:
     return _coerce_trigger(data)
 
 
+def topic_matches(pattern: str, topic: str) -> bool:
+    """True when a subscription to `pattern` is delivered `topic`.
+
+    The MQTT wildcards: `+` stands for exactly one level, `#` for the rest of
+    the topic and only as the last level (`agv/#` covers `agv` itself too).
+    A leading wildcard never matches a `$`-prefixed broker topic, as the spec
+    requires - those have to be asked for by name.
+    """
+    if pattern == topic:
+        return True
+    if not pattern or not topic:
+        return False
+
+    wanted = pattern.split("/")
+    actual = topic.split("/")
+    if wanted[0] in ("+", "#") and actual[0].startswith("$"):
+        return False
+
+    for i, level in enumerate(wanted):
+        if level == "#":
+            return i == len(wanted) - 1 and len(actual) >= i
+        if i >= len(actual) or (level != "+" and level != actual[i]):
+            return False
+    return len(wanted) == len(actual)
+
+
+def topic_filter_error(pattern: str) -> str | None:
+    """Why `pattern` cannot be subscribed to, or None when it is fine."""
+    if not pattern:
+        return "Enter a topic to watch."
+    if pattern != pattern.strip() or any(c in pattern for c in " \t\n"):
+        return "A topic cannot contain spaces, tabs or line breaks."
+    if "\x00" in pattern:
+        return "A topic cannot contain a null character."
+
+    levels = pattern.split("/")
+    for i, level in enumerate(levels):
+        if "#" in level:
+            if level != "#":
+                return "'#' has to sit on a level of its own, as in agv/#."
+            if i != len(levels) - 1:
+                return "'#' can only be the last level of a topic."
+        if "+" in level and level != "+":
+            return "'+' has to sit on a level of its own, as in agv/+/state."
+    return None
+
+
 # ============================================================================
 # Config
 # ============================================================================
@@ -605,6 +677,72 @@ class Robot:
         }
 
 
+@dataclass
+class Watch:
+    """One topic the monitor keeps an eye on.
+
+    `topic` is a subscription filter, so it may carry the MQTT wildcards -
+    `agv/+/state` for one level, `agv/#` for everything below `agv`. Untick
+    `enabled` to stop watching without losing the entry.
+    """
+
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    name: str = "New watch"
+    topic: str = DEFAULT_WATCH_TOPIC
+    qos: int = MONITOR_DEFAULT_QOS
+    enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Watch":
+        w = cls()
+        w.id = str(data.get("id") or w.id)
+        w.name = str(data.get("name", w.name))
+        w.topic = str(data.get("topic", w.topic)).strip()
+        try:
+            w.qos = int(data.get("qos", MONITOR_DEFAULT_QOS))
+        except (TypeError, ValueError):
+            w.qos = MONITOR_DEFAULT_QOS
+        w.qos = w.qos if w.qos in (0, 1, 2) else MONITOR_DEFAULT_QOS
+        w.enabled = bool(data.get("enabled", True))
+        return w
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "name": self.name, "topic": self.topic,
+                "qos": self.qos, "enabled": self.enabled}
+
+
+@dataclass
+class Capture:
+    """One message the monitor caught, kept exactly as it arrived."""
+
+    seq: int
+    at: str                     # local time with offset, as the payloads use
+    topic: str
+    payload: str
+    qos: int = 0
+    retain: bool = False
+
+    def clock(self) -> str:
+        """Just the time of day, for the feed - 14:34:00.680."""
+        tail = self.at.split("T")[-1]
+        return tail[:12] if len(tail) >= 12 else tail
+
+    def oneline(self, limit: int = MONITOR_LINE_LIMIT) -> str:
+        flat = " ".join(self.payload.split()) or "(empty payload)"
+        return flat if len(flat) <= limit else flat[:limit - 3] + "..."
+
+    def pretty(self) -> str:
+        """The payload laid out as JSON when it is JSON, else exactly as sent."""
+        try:
+            return json.dumps(json.loads(self.payload), indent=2, ensure_ascii=False)
+        except Exception:
+            return self.payload
+
+    def to_dict(self) -> dict:
+        return {"seq": self.seq, "at": self.at, "topic": self.topic,
+                "qos": self.qos, "retain": self.retain, "payload": self.payload}
+
+
 class Config:
     def __init__(self, vault: "LocalVault | None" = None) -> None:
         self.vault = vault
@@ -612,6 +750,7 @@ class Config:
         self.broker = dict(DEFAULT_BROKER)
         self.presets: list[Preset] = []
         self.robots: list[Robot] = []
+        self.watches: list[Watch] = []
         self.last_selected: str | None = None
         self.last_selected_robot: str | None = None
         self.autoscroll = True
@@ -625,6 +764,7 @@ class Config:
         if raw is None:
             cfg.presets = [cfg._seed_preset()]
             cfg.robots = cfg._seed_robots()
+            cfg.watches = cfg._seed_watches()
             return cfg
 
         cfg.appearance = raw.get("appearance", "System")
@@ -640,6 +780,12 @@ class Config:
             # Pre-2.0 settings, or every robot deleted - start from the two
             # the app ships with rather than an empty simulator.
             cfg.robots = cfg._seed_robots()
+        cfg.watches = [Watch.from_dict(w) for w in raw.get("watches", [])
+                       if isinstance(w, dict)]
+        if not cfg.watches:
+            # Pre-2.3 settings, or every watch deleted - start from the example
+            # one so the monitor has something to show how it is set up.
+            cfg.watches = cfg._seed_watches()
         cfg.last_selected = raw.get("last_selected")
         cfg.last_selected_robot = raw.get("last_selected_robot")
         cfg.autoscroll = bool(raw.get("autoscroll", True))
@@ -654,6 +800,10 @@ class Config:
     def _seed_robots() -> list[Robot]:
         return [Robot(name=name, base_topic=base, interval=SIM_DEFAULT_INTERVAL)
                 for name, base in DEFAULT_ROBOTS]
+
+    @staticmethod
+    def _seed_watches() -> list[Watch]:
+        return [Watch(name=name, topic=topic) for name, topic in DEFAULT_WATCHES]
 
     def _read_settings(self) -> dict | None:
         """Reads the encrypted vault, falling back to a pre-1.3 plain config.json.
@@ -694,11 +844,12 @@ class Config:
 
     def to_dict(self) -> dict:
         return {
-            "version": 3,
+            "version": 4,
             "appearance": self.appearance,
             "broker": self.broker,
             "presets": [p.to_dict() for p in self.presets],
             "robots": [r.to_dict() for r in self.robots],
+            "watches": [w.to_dict() for w in self.watches],
             "last_selected": self.last_selected,
             "last_selected_robot": self.last_selected_robot,
             "autoscroll": self.autoscroll,
@@ -731,6 +882,9 @@ class Config:
     def find_robot(self, robot_id: str | None) -> Robot | None:
         return next((r for r in self.robots if r.id == robot_id), None)
 
+    def find_watch(self, watch_id: str | None) -> Watch | None:
+        return next((w for w in self.watches if w.id == watch_id), None)
+
 
 # ============================================================================
 # MQTT connection
@@ -742,7 +896,7 @@ class MqttManager:
 
     def __init__(self, emit, on_message=None) -> None:
         self._emit = emit                     # emit(channel, level, text)
-        self._on_message_cb = on_message      # on_message(topic, payload_text)
+        self._on_message_cb = on_message      # on_message(topic, text, qos, retain)
         self._subs: dict[str, int] = {}       # topic -> qos, reapplied on connect
         self._lock = threading.RLock()
         self._client: mqtt.Client | None = None
@@ -803,7 +957,7 @@ class MqttManager:
         except Exception:
             text = repr(msg.payload)
         try:
-            self._on_message_cb(msg.topic, text)
+            self._on_message_cb(msg.topic, text, int(msg.qos), bool(msg.retain))
         except Exception as exc:
             self._emit("debug", "err",
                        f"Message handler error: {type(exc).__name__}: {exc}")
@@ -1601,6 +1755,19 @@ class App(ctk.CTk):
         self._sim_dirty = False
         self._sim_base_prev = ""                 # base the topic boxes were derived from
 
+        # Topic monitor - which topics are watched, and what has been caught.
+        self.watch_buttons: dict[str, ctk.CTkButton] = {}
+        self.selected_watch_id: str | None = None
+        self._watch_dirty = False
+        self.captures: deque = deque(maxlen=MONITOR_MAX_MESSAGES)
+        self.capture_counts: dict[str, int] = {}   # watch id -> messages seen
+        self.monitor_paused = False
+        self._capture_seq = 0
+        self._feed_rows: list[Capture] = []        # one per line in the feed box
+        self._selected_capture: Capture | None = None
+        self._follow_latest = True
+        self._seen_topics: set[str] = set()        # first sighting is worth a line
+
         ctk.set_appearance_mode(self.config_data.appearance)
         ctk.set_default_color_theme("blue")
 
@@ -1618,6 +1785,9 @@ class App(ctk.CTk):
         first_robot = (self.config_data.find_robot(self.config_data.last_selected_robot)
                        or self.config_data.robots[0])
         self._select_robot(first_robot.id)
+
+        self._refresh_watch_list()
+        self._select_watch(self.config_data.watches[0].id)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind(f"<{MODIFIER}-s>", lambda _e: self._save_preset())
@@ -1655,6 +1825,11 @@ class App(ctk.CTk):
             self.log("activity", "info",
                      f"[{robot.name}] waiting for a trigger on {robot.resolved_trigger}"
                      f"  ->  status to {robot.resolved_status}")
+        for watch in self.config_data.watches:
+            if watch.enabled:
+                self.log("activity", "info",
+                         f"[{watch.name}] watching {watch.topic} (QoS {watch.qos}) - "
+                         f"whatever is published there lands in the Topic monitor.")
 
         self.after(120, self._pump_events)
         self.after(500, self._tick_ui)
@@ -1673,11 +1848,11 @@ class App(ctk.CTk):
 
         self._build_header()
 
-        # Two screens over one connection and one log: the saved-message
-        # sender, and the robot simulator.
+        # Three screens over one connection and one log: the saved-message
+        # sender, the robot simulator, and the topic monitor.
         self.mode_tabs = ctk.CTkTabview(self, anchor="w")
         self.mode_tabs.grid(row=1, column=0, sticky="nsew", padx=10, pady=(8, 0))
-        for tab in (TAB_MESSAGES, TAB_SIMULATOR):
+        for tab in (TAB_MESSAGES, TAB_SIMULATOR, TAB_MONITOR):
             self.mode_tabs.add(tab)
             frame = self.mode_tabs.tab(tab)
             frame.grid_columnconfigure(0, weight=1)
@@ -1685,6 +1860,7 @@ class App(ctk.CTk):
 
         self._build_body()
         self._build_simulator()
+        self._build_monitor()
         self._build_log()
         self._build_statusbar()
 
@@ -2004,6 +2180,139 @@ class App(ctk.CTk):
                                      font=ctk.CTkFont(size=12))
         self.sim_hint.grid(row=0, column=3, sticky="e", padx=8)
 
+    def _build_monitor(self) -> None:
+        mon = ctk.CTkFrame(self.mode_tabs.tab(TAB_MONITOR), fg_color="transparent")
+        mon.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        mon.grid_columnconfigure(1, weight=1)
+        mon.grid_rowconfigure(0, weight=1)
+
+        # ---- left: the watched topics ----------------------------------
+        left = ctk.CTkFrame(mon, width=280)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        left.grid_propagate(False)
+        left.grid_rowconfigure(1, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(left, text="WATCHED TOPICS", anchor="w",
+                     font=ctk.CTkFont(size=12, weight="bold")).grid(
+            row=0, column=0, padx=14, pady=(14, 6), sticky="ew")
+
+        self.watch_list = ctk.CTkScrollableFrame(left, fg_color="transparent")
+        self.watch_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=0)
+        self.watch_list.grid_columnconfigure(0, weight=1)
+
+        btns = ctk.CTkFrame(left, fg_color="transparent")
+        btns.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+        btns.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(btns, text="+ Add", command=self._new_watch).grid(
+            row=0, column=0, padx=(0, 4), pady=3, sticky="ew")
+        ctk.CTkButton(btns, text="Duplicate", fg_color="transparent", border_width=1,
+                      command=self._duplicate_watch).grid(
+            row=0, column=1, padx=(4, 0), pady=3, sticky="ew")
+        ctk.CTkButton(btns, text="Delete", fg_color="transparent", border_width=1,
+                      text_color=("#c92a2a", "#ff6b6b"), hover_color=("#ffe3e3", "#4d1f1f"),
+                      command=self._delete_watch).grid(
+            row=1, column=0, padx=(0, 4), pady=3, sticky="ew")
+        ctk.CTkButton(btns, text="Clear caught", fg_color="transparent", border_width=1,
+                      command=self._clear_captures).grid(
+            row=1, column=1, padx=(4, 0), pady=3, sticky="ew")
+
+        # ---- right: the selected watch, then what it caught -------------
+        right = ctk.CTkFrame(mon)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_columnconfigure(1, weight=1)
+        right.grid_rowconfigure(5, weight=3)
+        right.grid_rowconfigure(7, weight=2)
+
+        def field(row: int, label: str, mono: bool = False) -> ctk.CTkEntry:
+            ctk.CTkLabel(right, text=label, anchor="w", width=110).grid(
+                row=row, column=0, padx=(16, 8), pady=4, sticky="w")
+            entry = ctk.CTkEntry(
+                right, font=ctk.CTkFont(family=MONO_FONT, size=13) if mono else None)
+            entry.grid(row=row, column=1, padx=(0, 16), pady=4, sticky="ew")
+            return entry
+
+        self.watch_name_entry = field(0, "Name")
+        self.watch_name_entry.bind("<KeyRelease>", self._mark_watch_dirty)
+        self.watch_topic_entry = field(1, "Topic", mono=True)
+        self.watch_topic_entry.bind("<KeyRelease>", self._mark_watch_dirty)
+
+        ctk.CTkLabel(right, text="Wildcards are allowed: agv/+/state for one level, "
+                                 "agv/# for everything below agv.",
+                     anchor="w", font=ctk.CTkFont(size=12),
+                     text_color=("#868e96", "#868e96")).grid(
+            row=2, column=1, padx=(0, 16), pady=(0, 6), sticky="w")
+
+        opts = ctk.CTkFrame(right, fg_color="transparent")
+        opts.grid(row=3, column=0, columnspan=2, padx=16, pady=(4, 8), sticky="ew")
+        opts.grid_columnconfigure(5, weight=1)
+        ctk.CTkLabel(opts, text="QoS").grid(row=0, column=0, padx=(0, 6))
+        self.watch_qos_menu = ctk.CTkOptionMenu(
+            opts, width=70, values=["0", "1", "2"],
+            command=lambda _v: self._mark_watch_dirty())
+        self.watch_qos_menu.grid(row=0, column=1, padx=(0, 16))
+        self.watch_enabled_check = ctk.CTkCheckBox(opts, text="Watching",
+                                                   command=self._mark_watch_dirty)
+        self.watch_enabled_check.grid(row=0, column=2, padx=(0, 16))
+        self.watch_save_btn = ctk.CTkButton(opts, text="Save", width=100,
+                                            command=self._save_watch)
+        self.watch_save_btn.grid(row=0, column=3, padx=(0, 12))
+        self.watch_hint = ctk.CTkLabel(opts, text="", anchor="w",
+                                       font=ctk.CTkFont(size=12))
+        self.watch_hint.grid(row=0, column=5, sticky="w")
+
+        # ---- what came back --------------------------------------------
+        tools = ctk.CTkFrame(right, fg_color="transparent")
+        tools.grid(row=4, column=0, columnspan=2, padx=16, pady=(4, 4), sticky="ew")
+        tools.grid_columnconfigure(1, weight=1)
+
+        self.monitor_counts_label = ctk.CTkLabel(
+            tools, text="0 caught", anchor="w",
+            font=ctk.CTkFont(family=MONO_FONT, size=12))
+        self.monitor_counts_label.grid(row=0, column=0, padx=(0, 16), sticky="w")
+
+        self.monitor_filter_entry = ctk.CTkEntry(
+            tools, placeholder_text="Filter by topic or payload...",
+            font=ctk.CTkFont(family=MONO_FONT, size=12))
+        self.monitor_filter_entry.grid(row=0, column=1, padx=(0, 12), sticky="ew")
+        self.monitor_filter_entry.bind("<KeyRelease>", lambda _e: self._render_feed())
+
+        self.follow_check = ctk.CTkCheckBox(tools, text="Follow latest",
+                                            command=self._toggle_follow)
+        self.follow_check.select()
+        self.follow_check.grid(row=0, column=2, padx=(0, 12))
+        self.monitor_pause_btn = ctk.CTkButton(tools, text="Pause", width=90,
+                                               fg_color="transparent", border_width=1,
+                                               command=self._toggle_capture_pause)
+        self.monitor_pause_btn.grid(row=0, column=3, padx=(0, 6))
+        ctk.CTkButton(tools, text="Export...", width=90, fg_color="transparent",
+                      border_width=1, command=self._export_captures).grid(
+            row=0, column=4)
+
+        self.feed_box = ctk.CTkTextbox(
+            right, font=ctk.CTkFont(family=MONO_FONT, size=12),
+            wrap="none", state="disabled")
+        self.feed_box.grid(row=5, column=0, columnspan=2, padx=16, pady=(0, 6),
+                           sticky="nsew")
+        self.feed_box.bind("<Button-1>", self._on_feed_click)
+
+        head = ctk.CTkFrame(right, fg_color="transparent")
+        head.grid(row=6, column=0, columnspan=2, padx=16, pady=(0, 2), sticky="ew")
+        head.grid_columnconfigure(0, weight=1)
+        self.detail_label = ctk.CTkLabel(
+            head, text="Nothing caught yet - click a line above to inspect one.",
+            anchor="w", font=ctk.CTkFont(size=12, weight="bold"))
+        self.detail_label.grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(head, text="Copy payload", width=110, height=26,
+                      fg_color="transparent", border_width=1,
+                      command=self._copy_capture).grid(row=0, column=1)
+
+        self.detail_box = ctk.CTkTextbox(
+            right, font=ctk.CTkFont(family=MONO_FONT, size=12),
+            wrap="none", state="disabled", height=150)
+        self.detail_box.grid(row=7, column=0, columnspan=2, padx=16, pady=(0, 14),
+                             sticky="nsew")
+
     def _build_log(self) -> None:
         wrapper = ctk.CTkFrame(self, fg_color="transparent")
         wrapper.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 8))
@@ -2060,6 +2369,7 @@ class App(ctk.CTk):
         self.config_data.save()
         self._refresh_preset_list()
         self._refresh_robot_list()
+        self._refresh_watch_list()
 
     def _apply_log_colors(self) -> None:
         mode = ctk.get_appearance_mode()
@@ -2067,6 +2377,15 @@ class App(ctk.CTk):
         for box in self.log_boxes.values():
             for tag, color in colors.items():
                 box.tag_config(tag, foreground=color)
+
+        # The monitor feed reads like the log, so it borrows the same palette.
+        feed = getattr(self, "feed_box", None)
+        if feed is not None:
+            feed.tag_config("clock", foreground=colors["ts"])
+            feed.tag_config("flag", foreground=colors["warn"])
+            feed.tag_config("topic", foreground=colors["rx"])
+            feed.tag_config("body", foreground=colors["info"])
+            feed.tag_config("pick", background="#2b3a55" if mode == "Dark" else "#dbe4ff")
 
     # --------------------------------------------------------------- log
     def log(self, channel: str, level: str, text: str) -> None:
@@ -2602,9 +2921,16 @@ class App(ctk.CTk):
 
     # ------------------------------------------------- simulator controls
     def _sync_subscriptions(self) -> None:
-        """Watch exactly the trigger topics the configured robots ask for."""
-        wanted = {r.resolved_trigger: SIM_TRIGGER_QOS
-                  for r in self.config_data.robots if r.resolved_trigger}
+        """Subscribe to exactly what the robots and the monitor between them ask
+        for, at the highest QoS either side wants for a shared topic."""
+        wanted: dict[str, int] = {}
+        for robot in self.config_data.robots:
+            topic = robot.resolved_trigger
+            if topic:
+                wanted[topic] = max(wanted.get(topic, 0), SIM_TRIGGER_QOS)
+        for watch in self.config_data.watches:
+            if watch.enabled and watch.topic:
+                wanted[watch.topic] = max(wanted.get(watch.topic, 0), watch.qos)
         self.mqtt.set_subscriptions(wanted)
 
     def _sim_start(self, robot: Robot) -> None:
@@ -2742,17 +3068,34 @@ class App(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     # --------------------------------------------------- incoming triggers
-    def _on_mqtt_message(self, topic: str, payload: str) -> None:
+    def _on_mqtt_message(self, topic: str, payload: str,
+                         qos: int = 0, retain: bool = False) -> None:
         """Called on the paho thread - hand it to the UI thread and return."""
-        self.events.put({"kind": "mqtt_message", "topic": topic, "payload": payload})
+        self.events.put({"kind": "mqtt_message", "topic": topic, "payload": payload,
+                         "qos": qos, "retain": retain})
 
-    def _handle_mqtt_message(self, topic: str, payload: str) -> None:
-        flat = " ".join(payload.split())
-        self.log("activity", "rx", f"RX  {topic}\n     {flat or '(empty payload)'}")
-
+    def _handle_mqtt_message(self, topic: str, payload: str,
+                             qos: int = 0, retain: bool = False) -> None:
+        caught_by = self._capture(topic, payload, qos, retain)
         watchers = [r for r in self.config_data.robots if r.resolved_trigger == topic]
-        if not watchers:
-            self.log("debug", "warn", f"No robot watches {topic} - message ignored.")
+        first_time = topic not in self._seen_topics
+        self._seen_topics.add(topic)
+
+        if watchers:
+            flat = " ".join(payload.split())
+            self.log("activity", "rx", f"RX  {topic}\n     {flat or '(empty payload)'}")
+        elif caught_by:
+            # A watched device publishes at whatever rate it likes - a busy one
+            # would bury the log a line at a time, and the monitor is already
+            # showing every one of them. Only the first sighting gets a line,
+            # so a topic that is arriving at all is visible from here.
+            if first_time:
+                self.log("activity", "info",
+                         f"Catching {topic} - it and the rest are on the Topic "
+                         f"monitor tab.")
+            return
+        else:
+            self.log("debug", "warn", f"Nothing watches {topic} - message ignored.")
             return
 
         wanted = parse_trigger(payload)
@@ -2819,6 +3162,447 @@ class App(ctk.CTk):
         for btn in (self.sim_bad_btn, self.sim_inject_btn,
                     self.sim_clear_btn, self.sim_force_btn):
             btn.configure(state=state)
+
+    # --------------------------------------------------------- monitor
+    #
+    # Everything below is the topic monitor: the watches that decide what is
+    # subscribed to, and the buffer of messages they caught.
+
+    def watch_topic(self, topic: str, qos: int = MONITOR_DEFAULT_QOS,
+                    name: str = "") -> "Watch | None":
+        """Catch every update published on `topic`, and return the watch.
+
+        This is the single call that turns a topic into a live capture. It
+        subscribes straight away when the app is connected and on the next
+        CONNACK otherwise, keeps everything that arrives in the monitor's
+        buffer - readable from `captured()` / `latest()`, visible on the Topic
+        monitor tab, and exportable from there - and saves the watch so it
+        comes back on the next launch.
+
+        `topic` is a subscription filter, so the MQTT wildcards work:
+        `agv/+/state` for one level, `agv/#` for a whole fleet. Asking for a
+        topic that is already watched re-enables it and raises its QoS if
+        needed rather than adding a second copy of it.
+
+            app.watch_topic("agv/#", name="AGV fleet")
+
+        Returns None, and says why in the log, when `topic` is not a topic a
+        broker would accept.
+        """
+        topic = (topic or "").strip()
+        problem = topic_filter_error(topic)
+        if problem:
+            self.log("activity", "err", f"Cannot watch '{topic}' - {problem}")
+            return None
+
+        qos = qos if qos in (0, 1, 2) else MONITOR_DEFAULT_QOS
+        existing = next((w for w in self.config_data.watches if w.topic == topic), None)
+        if existing is not None:
+            existing.enabled = True
+            existing.qos = max(existing.qos, qos)
+            if name:
+                existing.name = name
+            watch = existing
+        else:
+            watch = Watch(name=name or topic, topic=topic, qos=qos, enabled=True)
+            self.config_data.watches.append(watch)
+
+        self.config_data.save()
+        self._watch_dirty = False
+        self._refresh_watch_list()
+        self._select_watch(watch.id)
+        self._sync_subscriptions()
+        self.log("activity", "ok",
+                 f"[{watch.name}] watching {watch.topic} (QoS {watch.qos})"
+                 + ("" if self.mqtt.is_connected else " - subscribed once connected"))
+        return watch
+
+    def unwatch_topic(self, topic: str) -> bool:
+        """Stop watching `topic`. True if something was actually watching it."""
+        topic = (topic or "").strip()
+        hits = [w for w in self.config_data.watches if w.topic == topic and w.enabled]
+        for watch in hits:
+            watch.enabled = False
+        if not hits:
+            return False
+        self.config_data.save()
+        self._refresh_watch_list()
+        if self.selected_watch_id in [w.id for w in hits]:
+            self._select_watch(self.selected_watch_id)
+        self._sync_subscriptions()
+        self.log("activity", "info", f"Stopped watching {topic}.")
+        return True
+
+    def captured(self, topic: str = "") -> "list[Capture]":
+        """Everything caught so far, oldest first.
+
+        With `topic` given, only the messages whose topic that filter covers -
+        wildcards included, so `captured("agv/+/state")` narrows a broad watch
+        down to the updates worth checking.
+        """
+        if not topic:
+            return list(self.captures)
+        return [c for c in self.captures if topic_matches(topic, c.topic)]
+
+    def latest(self, topic: str = "") -> "Capture | None":
+        """The most recent caught message, optionally for one topic filter."""
+        found = self.captured(topic)
+        return found[-1] if found else None
+
+    # -- the watch list --------------------------------------------------
+    def _refresh_watch_list(self) -> None:
+        for widget in self.watch_list.winfo_children():
+            widget.destroy()
+        self.watch_buttons.clear()
+
+        for i, watch in enumerate(self.config_data.watches):
+            selected = watch.id == self.selected_watch_id
+            btn = ctk.CTkButton(
+                self.watch_list,
+                text=self._watch_label(watch),
+                anchor="w", height=36, corner_radius=6,
+                fg_color=("#dbe4ff", "#2b3a55") if selected else "transparent",
+                hover_color=("#e7ecff", "#33425e"),
+                text_color=("#1a1a1a", "#f0f0f0"),
+                command=lambda wid=watch.id: self._select_watch(wid),
+            )
+            btn.grid(row=i, column=0, sticky="ew", pady=2, padx=2)
+            self.watch_buttons[watch.id] = btn
+
+    def _watch_label(self, watch: "Watch") -> str:
+        seen = self.capture_counts.get(watch.id, 0)
+        marker = "●" if watch.enabled else "○"
+        return f"{marker}  {watch.name}" + (f"   {seen}" if seen else "")
+
+    def _update_watch_button(self, watch_id: str) -> None:
+        watch = self.config_data.find_watch(watch_id)
+        btn = self.watch_buttons.get(watch_id)
+        if watch is None or btn is None:
+            return
+        btn.configure(text=self._watch_label(watch),
+                      fg_color=("#dbe4ff", "#2b3a55")
+                      if watch_id == self.selected_watch_id else "transparent")
+
+    def _select_watch(self, watch_id: str) -> None:
+        if self._watch_dirty and self.selected_watch_id and self.selected_watch_id != watch_id:
+            keep = messagebox.askyesnocancel(
+                APP_NAME, "Save changes to the current watch first?", parent=self)
+            if keep is None:
+                return
+            if keep:
+                self._save_watch()
+
+        self.selected_watch_id = watch_id
+        watch = self.config_data.find_watch(watch_id)
+        if watch is None:
+            return
+
+        self.watch_name_entry.delete(0, "end")
+        self.watch_name_entry.insert(0, watch.name)
+        self.watch_topic_entry.delete(0, "end")
+        self.watch_topic_entry.insert(0, watch.topic)
+        self.watch_qos_menu.set(str(watch.qos))
+        if watch.enabled:
+            self.watch_enabled_check.select()
+        else:
+            self.watch_enabled_check.deselect()
+
+        self._watch_dirty = False
+        self.watch_save_btn.configure(text="Save")
+        seen = self.capture_counts.get(watch.id, 0)
+        self.watch_hint.configure(
+            text=f"{seen} message(s) caught on this watch" if seen
+            else ("Watching - nothing has arrived yet" if watch.enabled
+                  else "Not watching - tick Watching to subscribe"),
+            text_color=("#868e96", "#868e96"))
+        self._refresh_watch_list()
+
+    def _mark_watch_dirty(self, _event=None) -> None:
+        self._watch_dirty = True
+        self.watch_save_btn.configure(text="Save *")
+
+    def _read_watch_editor(self) -> "Watch | None":
+        watch = self.config_data.find_watch(self.selected_watch_id)
+        if watch is None:
+            return None
+
+        topic = self.watch_topic_entry.get().strip()
+        problem = topic_filter_error(topic)
+        if problem:
+            messagebox.showwarning(APP_NAME, problem, parent=self)
+            return None
+
+        return Watch(id=watch.id,
+                     name=self.watch_name_entry.get().strip() or topic,
+                     topic=topic,
+                     qos=int(self.watch_qos_menu.get()),
+                     enabled=bool(self.watch_enabled_check.get()))
+
+    def _save_watch(self) -> bool:
+        edited = self._read_watch_editor()
+        if edited is None:
+            return False
+
+        index = next((i for i, w in enumerate(self.config_data.watches)
+                      if w.id == edited.id), None)
+        if index is None:
+            return False
+        self.config_data.watches[index] = edited
+
+        ok, detail = self.config_data.save()
+        if not ok:
+            messagebox.showerror(APP_NAME, f"Could not save config:\n{detail}", parent=self)
+            return False
+
+        self._watch_dirty = False
+        self.watch_save_btn.configure(text="Save")
+        self._update_watch_button(edited.id)
+        self._sync_subscriptions()
+        self.status_left.configure(text=f"Saved '{edited.name}'")
+        self.log("activity", "info" if edited.enabled else "warn",
+                 f"[{edited.name}] watching {edited.topic} (QoS {edited.qos})"
+                 if edited.enabled
+                 else f"[{edited.name}] no longer watching {edited.topic}")
+        return True
+
+    def _new_watch(self) -> None:
+        number = len(self.config_data.watches) + 1
+        watch = Watch(name=f"Watch {number:02d}", topic=DEFAULT_WATCH_TOPIC,
+                      enabled=False)
+        self.config_data.watches.append(watch)
+        self.config_data.save()
+        self._watch_dirty = False
+        self._refresh_watch_list()
+        self._select_watch(watch.id)
+        self.watch_topic_entry.focus_set()
+        self.log("activity", "info",
+                 "New watch added - set its topic, then tick Watching to subscribe.")
+
+    def _duplicate_watch(self) -> None:
+        source = self.config_data.find_watch(self.selected_watch_id)
+        if source is None:
+            return
+        copy = Watch(name=f"{source.name} (copy)", topic=source.topic,
+                     qos=source.qos, enabled=False)
+        self.config_data.watches.insert(self.config_data.watches.index(source) + 1, copy)
+        self.config_data.save()
+        self._watch_dirty = False
+        self._refresh_watch_list()
+        self._select_watch(copy.id)
+
+    def _delete_watch(self) -> None:
+        watch = self.config_data.find_watch(self.selected_watch_id)
+        if watch is None:
+            return
+        if len(self.config_data.watches) == 1:
+            messagebox.showinfo(
+                APP_NAME, "At least one watch must remain. Untick Watching to stop "
+                          "it without deleting it.", parent=self)
+            return
+        if not messagebox.askyesno(APP_NAME, f"Delete '{watch.name}'?", parent=self):
+            return
+        index = self.config_data.watches.index(watch)
+        self.config_data.watches.remove(watch)
+        self.capture_counts.pop(watch.id, None)
+        self.config_data.save()
+        self._watch_dirty = False
+        self._refresh_watch_list()
+        self._select_watch(self.config_data.watches[max(0, index - 1)].id)
+        self._sync_subscriptions()
+
+    # -- the capture buffer ----------------------------------------------
+    def _capture(self, topic: str, payload: str, qos: int, retain: bool) -> "list[Watch]":
+        """Keep a message if any watch covers it. Returns the watches that did."""
+        matched = [w for w in self.config_data.watches
+                   if w.enabled and w.topic and topic_matches(w.topic, topic)]
+        if not matched or self.monitor_paused:
+            return matched
+
+        self._capture_seq += 1
+        record = Capture(seq=self._capture_seq, at=_timestamp(), topic=topic,
+                         payload=payload, qos=qos, retain=retain)
+        self.captures.append(record)
+        for watch in matched:
+            self.capture_counts[watch.id] = self.capture_counts.get(watch.id, 0) + 1
+            self._update_watch_button(watch.id)
+            if watch.id == self.selected_watch_id:
+                self.watch_hint.configure(
+                    text=f"{self.capture_counts[watch.id]} message(s) caught on this watch")
+        self._feed_append(record)
+        return matched
+
+    def _feed_shows(self, record: "Capture") -> bool:
+        needle = self.monitor_filter_entry.get().strip().lower()
+        if not needle:
+            return True
+        return needle in record.topic.lower() or needle in record.payload.lower()
+
+    def _feed_append(self, record: "Capture", quiet: bool = False) -> None:
+        """Put one caught message on the end of the feed. `quiet` is for the
+        bulk rebuild, which updates the counter once at the end instead."""
+        if not self._feed_shows(record):
+            if not quiet:
+                self._update_monitor_counts()
+            return
+
+        box = self.feed_box
+        box.configure(state="normal")
+        box.insert("end", f"{record.clock():>12}  ", "clock")
+        box.insert("end", "[R] " if record.retain else "    ", "flag")
+        box.insert("end", record.topic, "topic")
+        box.insert("end", f"   {record.oneline()}\n", "body")
+        self._feed_rows.append(record)
+        while len(self._feed_rows) > MONITOR_MAX_MESSAGES:
+            box.delete("1.0", "2.0")
+            self._feed_rows.pop(0)
+        box.configure(state="disabled")
+
+        if self._follow_latest:
+            box.see("end")
+            self._show_capture(record)
+        if not quiet:
+            self._update_monitor_counts()
+
+    def _render_feed(self) -> None:
+        """Rebuild the feed from the buffer - after a filter change or a clear."""
+        box = self.feed_box
+        box.configure(state="normal")
+        box.delete("1.0", "end")
+        box.configure(state="disabled")
+        self._feed_rows = []
+
+        follow, self._follow_latest = self._follow_latest, False
+        for record in list(self.captures):
+            self._feed_append(record, quiet=True)
+        self._follow_latest = follow
+
+        if self._feed_rows:
+            box.see("end")
+            if follow:
+                self._show_capture(self._feed_rows[-1])
+        else:
+            self._show_capture(None)
+        self._update_monitor_counts()
+
+    def _show_capture(self, record: "Capture | None") -> None:
+        self._selected_capture = record
+        self.feed_box.tag_remove("pick", "1.0", "end")
+
+        if record is None:
+            self.detail_label.configure(
+                text="Nothing caught yet - click a line above to inspect one.")
+            self.detail_box.configure(state="normal")
+            self.detail_box.delete("1.0", "end")
+            self.detail_box.configure(state="disabled")
+            return
+
+        if self._feed_rows and self._feed_rows[-1] is record:
+            line = len(self._feed_rows)
+        else:
+            try:
+                line = self._feed_rows.index(record) + 1
+            except ValueError:
+                line = 0
+        if line:
+            self.feed_box.tag_add("pick", f"{line}.0", f"{line}.end+1c")
+
+        self.detail_label.configure(
+            text=f"{record.topic}     QoS {record.qos}"
+                 + ("   retained" if record.retain else "")
+                 + f"     {record.at}")
+        self.detail_box.configure(state="normal")
+        self.detail_box.delete("1.0", "end")
+        self.detail_box.insert("1.0", record.pretty())
+        self.detail_box.configure(state="disabled")
+
+    def _on_feed_click(self, event) -> None:
+        if not self._feed_rows:
+            return
+        line = int(self.feed_box.index(f"@{event.x},{event.y}").split(".")[0])
+        if not 1 <= line <= len(self._feed_rows):
+            return
+        # Picking a line by hand means looking at that one, not at whatever
+        # arrives next - so stop following until the box is ticked again.
+        if self._follow_latest:
+            self._follow_latest = False
+            self.follow_check.deselect()
+        self._show_capture(self._feed_rows[line - 1])
+
+    def _toggle_follow(self) -> None:
+        self._follow_latest = bool(self.follow_check.get())
+        if self._follow_latest and self._feed_rows:
+            self.feed_box.see("end")
+            self._show_capture(self._feed_rows[-1])
+
+    def _toggle_capture_pause(self) -> None:
+        self.monitor_paused = not self.monitor_paused
+        self.monitor_pause_btn.configure(text="Resume" if self.monitor_paused else "Pause")
+        self.log("activity", "info",
+                 "Monitor paused - messages still show in the Activity log, they are "
+                 "just not being kept." if self.monitor_paused
+                 else "Monitor capturing again.")
+        self._update_monitor_counts()
+
+    def _clear_captures(self) -> None:
+        self.captures.clear()
+        self.capture_counts.clear()
+        self._seen_topics.clear()
+        self._render_feed()
+        self._refresh_watch_list()
+        self.watch_hint.configure(text="Cleared - waiting for the next message")
+        self.status_left.configure(text="Caught messages cleared")
+
+    def _copy_capture(self) -> None:
+        record = self._selected_capture
+        if record is None:
+            messagebox.showinfo(APP_NAME, "Pick a caught message first.", parent=self)
+            return
+        self.clipboard_clear()
+        self.clipboard_append(record.pretty())
+        self.status_left.configure(text=f"Payload from {record.topic} copied")
+
+    def _export_captures(self) -> None:
+        rows = [c for c in self.captures if self._feed_shows(c)]
+        if not rows:
+            messagebox.showinfo(APP_NAME, "Nothing caught to export yet.", parent=self)
+            return
+
+        default = f"mqtt-capture-{datetime.now():%Y%m%d-%H%M%S}.json"
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Export caught messages", initialfile=default,
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("CSV", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+
+        try:
+            if path.lower().endswith(".csv"):
+                with open(path, "w", newline="", encoding="utf-8") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(["seq", "at", "topic", "qos", "retain", "payload"])
+                    for record in rows:
+                        writer.writerow([record.seq, record.at, record.topic,
+                                         record.qos, record.retain, record.payload])
+            else:
+                Path(path).write_text(json.dumps({
+                    "exported_by": f"{APP_NAME} {APP_VERSION}",
+                    "exported_at": datetime.now().isoformat(timespec="seconds"),
+                    "messages": [record.to_dict() for record in rows],
+                }, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Could not write file:\n{exc}", parent=self)
+            return
+
+        self.status_left.configure(text=f"{len(rows)} message(s) exported to {path}")
+        self.log("activity", "ok",
+                 f"Exported {len(rows)} caught message(s) to {path}")
+
+    def _update_monitor_counts(self) -> None:
+        shown = len(self._feed_rows)
+        held = len(self.captures)
+        state = "paused" if self.monitor_paused else "live"
+        detail = f"{held} caught" if shown == held else f"{shown} of {held} caught"
+        self.monitor_counts_label.configure(text=f"{detail}   ({state})")
 
     def _autoconnect(self) -> None:
         if self.mqtt.is_connected or not self.config_data.broker.get("host"):
@@ -3014,6 +3798,7 @@ class App(ctk.CTk):
 
         presets = [Preset.from_dict(p) for p in data.get("presets", []) if isinstance(p, dict)]
         robots = [Robot.from_dict(r) for r in data.get("robots", []) if isinstance(r, dict)]
+        watches = [Watch.from_dict(w) for w in data.get("watches", []) if isinstance(w, dict)]
         broker = data.get("broker") or {}
         if not isinstance(broker, dict) or not broker.get("host"):
             messagebox.showerror(APP_NAME, "That profile has no broker settings in it.",
@@ -3030,6 +3815,7 @@ class App(ctk.CTk):
 
         self.config_data.presets = presets or [Config._seed_preset()]
         self.config_data.robots = robots or Config._seed_robots()
+        self.config_data.watches = watches or Config._seed_watches()
         self.config_data.last_selected = None
         self.config_data.last_selected_robot = None
         password = data.get("password") or ""
@@ -3039,10 +3825,18 @@ class App(ctk.CTk):
         self._select_preset(self.config_data.presets[0].id)
         self._refresh_robot_list()
         self._select_robot(self.config_data.robots[0].id)
+        # What was caught belongs to the topics that were watched a moment ago,
+        # so it would only be confusing next to the imported ones.
+        self._watch_dirty = False
+        self._refresh_watch_list()
+        self._select_watch(self.config_data.watches[0].id)
+        self._clear_captures()
+        self._sync_subscriptions()
         self.apply_broker_settings(merged, password or self.password)
 
         self.log("activity", "ok",
-                 f"Imported {len(self.config_data.presets)} message(s) and broker "
+                 f"Imported {len(self.config_data.presets)} message(s), "
+                 f"{len(self.config_data.watches)} watch(es) and broker "
                  f"settings from {Path(path).name}"
                  + (" (password included)" if password else " (no password in file)"))
         if not password:
@@ -3181,7 +3975,8 @@ class App(ctk.CTk):
                 self._sync_subscriptions()
 
         elif kind == "mqtt_message":
-            self._handle_mqtt_message(event["topic"], event["payload"])
+            self._handle_mqtt_message(event["topic"], event["payload"],
+                                      event.get("qos", 0), event.get("retain", False))
 
         elif kind == "started":
             self._set_connection_ui(self.mqtt.is_connected)
@@ -3271,6 +4066,13 @@ class App(ctk.CTk):
                 APP_NAME, f"{' and '.join(busy)} still running.\n\nQuit anyway?",
                 parent=self):
             return
+        if self._watch_dirty:
+            keep = messagebox.askyesnocancel(
+                APP_NAME, "Save changes to the current watch before quitting?", parent=self)
+            if keep is None:
+                return
+            if keep:
+                self._save_watch()
         if self._sim_dirty:
             keep = messagebox.askyesnocancel(
                 APP_NAME, "Save changes to the current robot before quitting?", parent=self)
