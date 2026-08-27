@@ -26,7 +26,7 @@ which is still here and still works.
 
 ### Windows
 
-Download **`MQTT-Trigger-2.2.0.exe`** from the
+Download **`MQTT-Trigger-2.3.2.exe`** from the
 [Releases page](https://github.com/ApollosRGB/Gradion-MQTT-message-sender/releases)
 and run it. It is a single self-contained file — the machine running it does
 **not** need Python installed.
@@ -40,8 +40,8 @@ Download the **`.dmg`** for your Mac from the
 
 | Your Mac | File |
 |---|---|
-| Apple Silicon (M1/M2/M3/M4) | `MQTT-Trigger-2.2.0-macOS-arm64.dmg` |
-| Intel | `MQTT-Trigger-2.2.0-macOS-x86_64.dmg` |
+| Apple Silicon (M1/M2/M3/M4) | `MQTT-Trigger-2.3.2-macOS-arm64.dmg` |
+| Intel | `MQTT-Trigger-2.3.2-macOS-x86_64.dmg` |
 
 Not sure which you have?  → menu → **About This Mac**. "Apple M…" means Apple
 Silicon.
@@ -359,11 +359,18 @@ the higher QoS wherever they overlap.
 
 ### Reading what arrived
 
-The feed underneath is one line per message — time, `[R]` if the broker sent it
-as a retained message, topic, then the payload flattened onto one line. Click a
-line and the panel at the bottom shows that message in full: topic, QoS,
-retained or not, the timestamp it was caught at, and the payload laid out as
-JSON when it is JSON, or exactly as it arrived when it is not.
+The feed underneath shows **the watch selected on the left**, one line per
+message — time, `[R]` if the broker sent it as a retained message, topic, then
+the payload flattened onto one line. Click a line and the panel at the bottom
+shows that message in full: topic, QoS, retained or not, the timestamp it was
+caught at, and the payload laid out as JSON when it is JSON, or exactly as it
+arrived when it is not.
+
+Picking a different watch switches the feed to that topic. The others keep
+catching in the background — their counts carry on climbing in the list — they
+are simply not on screen, which is what stops a 10 Hz topic burying the one you
+came here to read. **Show all in one feed**, above the list, puts every watch
+back into a single feed when comparing them is the point.
 
 - **Follow latest** (ticked by default) keeps the newest message selected and in
   view. Clicking a line unticks it, because you are reading that one now — tick
@@ -381,8 +388,10 @@ JSON when it is JSON, or exactly as it arrived when it is not.
   retain flag and payload) or `.csv` (the same, one row per message). The file
   extension you choose decides the format.
 
-The buffer holds the last 2000 messages; older ones fall off the end. A count
-next to each watch shows how many messages it has caught.
+The buffer holds the last 2000 messages across every watch; older ones fall off
+the end. A count next to each watch shows how many messages it has caught, and
+the counter above the feed reads `5 of 340 caught` when what is on screen is a
+subset of what is held.
 
 ### From a script
 

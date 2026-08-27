@@ -74,7 +74,7 @@ import paho.mqtt.client as mqtt
 # ============================================================================
 
 APP_NAME = "MQTT Trigger"
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.3.2"
 KEYRING_SERVICE = "MQTTTrigger"
 
 # Credential-vault account name for the random key that encrypts the settings
@@ -1847,6 +1847,11 @@ class App(ctk.CTk):
         self._feed_rows: list[Capture] = []        # one per line in the feed box
         self._selected_capture: Capture | None = None
         self._follow_latest = True
+        # The feed shows the selected watch, not every watch at once - picking
+        # a topic on the left is how you look at one topic. `_show_all_watches`
+        # puts the whole lot back in one feed on demand.
+        self._show_all_watches = False
+        self._feed_scope_shown = ""                # topic the feed is built for
         self._seen_topics: set[str] = set()        # first sighting is worth a line
 
         ctk.set_appearance_mode(self.config_data.appearance)
@@ -2271,7 +2276,7 @@ class App(ctk.CTk):
         left = ctk.CTkFrame(mon, width=280)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         left.grid_propagate(False)
-        left.grid_rowconfigure(1, weight=1)
+        left.grid_rowconfigure(2, weight=1)
         left.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(left, text="WATCHED TOPICS", anchor="w",
@@ -2279,11 +2284,18 @@ class App(ctk.CTk):
             row=0, column=0, padx=14, pady=(14, 6), sticky="ew")
 
         self.watch_list = ctk.CTkScrollableFrame(left, fg_color="transparent")
-        self.watch_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=0)
+        self.watch_list.grid(row=2, column=0, sticky="nsew", padx=6, pady=0)
         self.watch_list.grid_columnconfigure(0, weight=1)
 
+        # Which watch the feed shows is a question about this list, so the
+        # answer lives beside it rather than over with the feed's own tools.
+        self.all_watches_check = ctk.CTkCheckBox(
+            left, text="Show all in one feed", font=ctk.CTkFont(size=12),
+            command=self._toggle_all_watches)
+        self.all_watches_check.grid(row=1, column=0, padx=14, pady=(0, 8), sticky="w")
+
         btns = ctk.CTkFrame(left, fg_color="transparent")
-        btns.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+        btns.grid(row=3, column=0, sticky="ew", padx=10, pady=10)
         btns.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(btns, text="+ Add", command=self._new_watch).grid(
             row=0, column=0, padx=(0, 4), pady=3, sticky="ew")
@@ -3448,6 +3460,7 @@ class App(ctk.CTk):
         self.watch_save_btn.configure(text="Save")
         self._refresh_watch_hint(watch)
         self._refresh_watch_list()
+        self._refresh_feed_scope()
 
     def _mark_watch_dirty(self, _event=None) -> None:
         self._watch_dirty = True
@@ -3512,6 +3525,7 @@ class App(ctk.CTk):
         self.watch_save_btn.configure(text="Save")
         self._update_watch_button(edited.id)
         self._sync_subscriptions()
+        self._refresh_feed_scope()
         self.status_left.configure(text=f"Saved '{edited.name}'")
         self.log("activity", "info" if edited.enabled else "warn",
                  f"[{edited.name}] watching {edited.topic} (QoS {edited.qos})"
@@ -3584,7 +3598,31 @@ class App(ctk.CTk):
         self._feed_append(record)
         return matched
 
+    def _feed_scope(self) -> str:
+        """Topic filter the feed is limited to - empty means every watch.
+
+        One watch is selected at a time on the left, and its messages are what
+        the feed is for. A busy neighbour would otherwise bury the topic being
+        looked at, in a panel that gives no sign whose messages these are.
+        """
+        if self._show_all_watches:
+            return ""
+        watch = self.config_data.find_watch(self.selected_watch_id)
+        return watch.topic if watch is not None else ""
+
+    def _refresh_feed_scope(self) -> None:
+        """Rebuild the feed if a different watch is being looked at now."""
+        if self._feed_scope() != self._feed_scope_shown:
+            self._render_feed()
+
+    def _toggle_all_watches(self) -> None:
+        self._show_all_watches = bool(self.all_watches_check.get())
+        self._render_feed()
+
     def _feed_shows(self, record: "Capture") -> bool:
+        scope = self._feed_scope()
+        if scope and not topic_matches(scope, record.topic):
+            return False
         needle = self.monitor_filter_entry.get().strip().lower()
         if not needle:
             return True
@@ -3617,7 +3655,9 @@ class App(ctk.CTk):
             self._update_monitor_counts()
 
     def _render_feed(self) -> None:
-        """Rebuild the feed from the buffer - after a filter change or a clear."""
+        """Rebuild the feed from the buffer - after a change of watch, filter or
+        a clear."""
+        self._feed_scope_shown = self._feed_scope()
         box = self.feed_box
         box.configure(state="normal")
         box.delete("1.0", "end")
@@ -3755,6 +3795,9 @@ class App(ctk.CTk):
         held = len(self.captures)
         state = "paused" if self.monitor_paused else "live"
         detail = f"{held} caught" if shown == held else f"{shown} of {held} caught"
+        # "5 of 340" with the feed scoped to one watch is explained by the
+        # unticked box beside the list, so this stays short - a scope spelled
+        # out here would crush the filter box sitting next to it.
         self.monitor_counts_label.configure(text=f"{detail}   ({state})")
 
     def _autoconnect(self) -> None:
