@@ -53,7 +53,7 @@ PY=""
 for candidate in python3 python; do
     command -v "$candidate" >/dev/null 2>&1 && { PY="$candidate"; break; }
 done
-VERSION=$("$PY" -c 'import re,pathlib; print(re.search(r"APP_VERSION = \"([^\"]+)\"", pathlib.Path("mqtt_trigger_app.py").read_text(encoding="utf-8")).group(1))' 2>/dev/null || echo "2.3.0")
+VERSION=$("$PY" -c 'import re,pathlib; print(re.search(r"APP_VERSION = \"([^\"]+)\"", pathlib.Path("mqtt_trigger_app.py").read_text(encoding="utf-8")).group(1))' 2>/dev/null || echo "2.3.1")
 ARCH=$(uname -m)
 DMG="dist/MQTT-Trigger-${VERSION}-macOS-${ARCH}.dmg"
 

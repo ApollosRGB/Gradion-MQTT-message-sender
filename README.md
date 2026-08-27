@@ -315,9 +315,30 @@ whether it is currently watching. **+ Add** makes one, **Duplicate** copies the
 selected one, **Delete** removes it, and **Clear caught** empties the buffer
 without touching the list.
 
-Fill in **Topic**, tick **Watching**, press **Save**. The subscription goes out
-straight away when the app is connected, and on the next connection otherwise —
-so a watch set up before the broker is reachable still works once it is.
+Fill in **Topic**, tick **Watching**, press **Save** — or just press **Enter**
+in the box, or click away from it, which saves the edit for you. A topic that
+was typed but never saved is not a topic anybody is subscribed to, and that is
+the difference between a watch that looks live and one that is.
+
+The subscription goes out straight away when the app is connected, and on the
+next connection otherwise — so a watch set up before the broker is reachable
+still works once it is.
+
+*New in 2.3.1.* Asking is not the same as being subscribed. A broker is free to
+turn a filter down — an ACL that does not cover it is the usual reason — or to
+grant it at a lower QoS than you asked for, and neither arrives as an error you
+would otherwise see. The app now waits for the broker's answer and says what it
+was:
+
+| The watch shows | What the broker said |
+|---|---|
+| ● | subscribed, at the QoS asked for |
+| ● *granted QoS 0, not 1* | subscribed, with weaker delivery guarantees |
+| ✕ *Broker refused this topic* | turned down — nothing published there will arrive |
+
+A refusal goes into the Activity log in red as well. Without this a refused
+topic looks exactly like a quiet one, and a `.../state` that never updates is
+indistinguishable from an AGV that is standing still.
 
 Wildcards are the point of this, not an extra:
 

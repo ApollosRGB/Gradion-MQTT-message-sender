@@ -74,7 +74,7 @@ import paho.mqtt.client as mqtt
 # ============================================================================
 
 APP_NAME = "MQTT Trigger"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.3.1"
 KEYRING_SERVICE = "MQTTTrigger"
 
 # Credential-vault account name for the random key that encrypts the settings
@@ -199,6 +199,9 @@ DEFAULT_ROBOTS = [
 
 DEFAULT_WATCH_TOPIC = "example/agv/#"
 MONITOR_DEFAULT_QOS = 1
+# What a broker's SUBACK said about a topic, when it did not grant a QoS: the
+# subscription was turned down, and nothing published there will ever arrive.
+SUB_REFUSED = -1
 MONITOR_MAX_MESSAGES = 2000    # ring buffer - the oldest fall off the end
 MONITOR_LINE_LIMIT = 400       # payload characters shown on one feed line
 
@@ -894,10 +897,17 @@ class Config:
 class MqttManager:
     """Owns a single shared paho client. All publishing goes through here."""
 
-    def __init__(self, emit, on_message=None) -> None:
+    def __init__(self, emit, on_message=None, on_sub_result=None) -> None:
         self._emit = emit                     # emit(channel, level, text)
         self._on_message_cb = on_message      # on_message(topic, text, qos, retain)
+        self._on_sub_result_cb = on_sub_result  # on_sub_result(topic, granted)
         self._subs: dict[str, int] = {}       # topic -> qos, reapplied on connect
+        # A subscription is only live once the broker has said so. Until the
+        # SUBACK lands a topic is pending; after it, `granted` holds the QoS the
+        # broker actually gave - or REFUSED, which means nothing will ever
+        # arrive on it however long the app waits.
+        self._pending: dict[int, list[tuple[str, int]]] = {}   # mid -> [(topic, qos)]
+        self._granted: dict[str, int] = {}    # topic -> granted qos, or REFUSED
         self._lock = threading.RLock()
         self._client: mqtt.Client | None = None
         self._connack = threading.Event()
@@ -929,7 +939,11 @@ class MqttManager:
                                       f"{self.broker['host']}:{self.broker['port']}")
             # A reconnect comes back with an empty session, so every
             # subscription has to be asked for again - otherwise triggers stop
-            # arriving silently after a dropped connection.
+            # arriving silently after a dropped connection. Last session's
+            # answers went with it, so the topics are pending again until this
+            # broker has acknowledged them.
+            self._pending.clear()
+            self._granted.clear()
             self._resubscribe()
         else:
             self._connected.clear()
@@ -962,18 +976,74 @@ class MqttManager:
             self._emit("debug", "err",
                        f"Message handler error: {type(exc).__name__}: {exc}")
 
+    def _on_subscribe(self, client, userdata, mid, reason_codes, properties=None):
+        """The broker's answer to one SUBSCRIBE.
+
+        Asking is not the same as being subscribed: a broker is free to turn a
+        filter down - an ACL that does not cover it is the usual reason - or to
+        grant it at a lower QoS than was asked for. Both come back in the
+        SUBACK and neither raises anything, so without reading it here a
+        refused topic looks exactly like a quiet one, and the app would sit
+        waiting for updates the broker is never going to send.
+        """
+        asked = self._pending.pop(mid, [])
+        codes = reason_codes if isinstance(reason_codes, (list, tuple)) else [reason_codes]
+        for i, (topic, wanted) in enumerate(asked):
+            code = codes[i] if i < len(codes) else None
+            value = getattr(code, "value", code)
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = 0
+            if value >= 0x80:
+                self._granted[topic] = SUB_REFUSED
+                self._emit("activity", "err",
+                           f"Broker refused the subscription to {topic} - nothing "
+                           f"published there will be caught. Check the topic, and "
+                           f"what this account is allowed to read.")
+            else:
+                self._granted[topic] = value
+                if value < wanted:
+                    self._emit("activity", "warn",
+                               f"Broker granted {topic} at QoS {value}, not the "
+                               f"QoS {wanted} asked for - updates still arrive, "
+                               f"with weaker delivery guarantees.")
+                else:
+                    self._emit("debug", "ok", f"SUBACK {topic}  (QoS {value})")
+            if self._on_sub_result_cb is not None:
+                try:
+                    self._on_sub_result_cb(topic, self._granted[topic])
+                except Exception as exc:
+                    self._emit("debug", "err",
+                               f"Subscribe handler error: {type(exc).__name__}: {exc}")
+
     # -- subscriptions ----------------------------------------------------
+    def _subscribe(self, client, topic: str, qos: int) -> None:
+        """Ask for one topic, and keep the mid so the SUBACK can be read."""
+        self._granted.pop(topic, None)          # pending until the broker answers
+        try:
+            rc, mid = client.subscribe(topic, qos)
+        except Exception as exc:
+            self._emit("activity", "err", f"Subscribe to {topic} failed - {exc}")
+            return
+        if rc != mqtt.MQTT_ERR_SUCCESS:
+            # paho reports a call it could not make this way rather than
+            # raising, so without this the topic is left unsubscribed in
+            # silence and the watch on it never sees anything.
+            self._emit("activity", "err",
+                       f"Subscribe to {topic} failed - {mqtt.error_string(rc)}")
+            return
+        if mid is not None:
+            self._pending[mid] = [(topic, qos)]
+        self._emit("debug", "info", f"SUB  {topic}  (QoS {qos}) - awaiting SUBACK")
+
     def _resubscribe(self) -> None:
         """Reapply every wanted subscription. Runs after each CONNACK."""
         client = self._client
         if client is None:
             return
         for topic, qos in list(self._subs.items()):
-            try:
-                client.subscribe(topic, qos)
-                self._emit("debug", "info", f"SUB  {topic}  (QoS {qos})")
-            except Exception as exc:
-                self._emit("debug", "err", f"Subscribe to {topic} failed - {exc}")
+            self._subscribe(client, topic, qos)
 
     def set_subscriptions(self, wanted: dict[str, int]) -> None:
         """Make the live subscriptions match `wanted` exactly."""
@@ -981,30 +1051,37 @@ class MqttManager:
             client = self._client if self._connected.is_set() else None
             for topic in [t for t in self._subs if t not in wanted]:
                 self._subs.pop(topic, None)
+                self._granted.pop(topic, None)
                 if client is None:
                     continue
                 try:
-                    client.unsubscribe(topic)
+                    rc, _mid = client.unsubscribe(topic)
+                    if rc != mqtt.MQTT_ERR_SUCCESS:
+                        raise RuntimeError(mqtt.error_string(rc))
                     self._emit("debug", "info", f"UNSUB {topic}")
                 except Exception as exc:
                     self._emit("debug", "warn",
                                f"Unsubscribe from {topic} failed - {exc}")
 
             for topic, qos in wanted.items():
-                if self._subs.get(topic) == qos:
+                # A topic already asked for at this QoS is only left alone once
+                # the broker has actually granted it - one still pending, or one
+                # that came back refused, is worth asking for again.
+                if self._subs.get(topic) == qos and self._granted.get(topic, SUB_REFUSED) >= 0:
                     continue
                 self._subs[topic] = qos
                 if client is None:
                     continue
-                try:
-                    client.subscribe(topic, qos)
-                    self._emit("debug", "info", f"SUB  {topic}  (QoS {qos})")
-                except Exception as exc:
-                    self._emit("debug", "err", f"Subscribe to {topic} failed - {exc}")
+                self._subscribe(client, topic, qos)
 
     @property
     def subscriptions(self) -> dict[str, int]:
         return dict(self._subs)
+
+    def granted_qos(self, topic: str) -> "int | None":
+        """QoS the broker gave `topic`, SUB_REFUSED if it said no, None while
+        the SUBACK is outstanding or nothing has asked for the topic."""
+        return self._granted.get(topic)
 
     # -- lifecycle --------------------------------------------------------
     def connect(self, timeout: float = CONNECT_TIMEOUT_S) -> tuple[bool, str]:
@@ -1020,6 +1097,7 @@ class MqttManager:
             client.on_connect = self._on_connect
             client.on_disconnect = self._on_disconnect
             client.on_message = self._on_message
+            client.on_subscribe = self._on_subscribe
             client.on_log = self._on_log
             client.reconnect_delay_set(min_delay=1, max_delay=30)
 
@@ -1076,6 +1154,8 @@ class MqttManager:
     def _teardown(self) -> None:
         client, self._client = self._client, None
         self._connected.clear()
+        self._pending.clear()
+        self._granted.clear()
         if client is None:
             return
         try:
@@ -1735,7 +1815,8 @@ class App(ctk.CTk):
         self.password = self.secrets.get(SecretStore.key_for(self.config_data.broker))
 
         self.events: queue.Queue = queue.Queue()
-        self.mqtt = MqttManager(self._emit_from_thread, self._on_mqtt_message)
+        self.mqtt = MqttManager(self._emit_from_thread, self._on_mqtt_message,
+                                self._on_sub_result)
         self.mqtt.configure(self.config_data.broker, self.password)
 
         self.runners: dict[str, LoopRunner] = {}
@@ -2233,9 +2314,17 @@ class App(ctk.CTk):
             return entry
 
         self.watch_name_entry = field(0, "Name")
-        self.watch_name_entry.bind("<KeyRelease>", self._mark_watch_dirty)
         self.watch_topic_entry = field(1, "Topic", mono=True)
-        self.watch_topic_entry.bind("<KeyRelease>", self._mark_watch_dirty)
+        # A topic that has been typed but not saved is not subscribed to, so an
+        # edit that never reaches Save is an app that looks like it is watching
+        # and is not. Enter applies it, and moving off the box applies it too,
+        # so the only way to leave an edit hanging is to say no when asked.
+        for entry in (self.watch_name_entry, self.watch_topic_entry):
+            entry.bind("<KeyRelease>", self._mark_watch_dirty)
+            entry.bind("<<Paste>>", self._mark_watch_dirty_soon)
+            entry.bind("<Return>", self._apply_watch_edit)
+            entry.bind("<KP_Enter>", self._apply_watch_edit)
+            entry.bind("<FocusOut>", self._apply_watch_edit)
 
         ctk.CTkLabel(right, text="Wildcards are allowed: agv/+/state for one level, "
                                  "agv/# for everything below agv.",
@@ -3074,6 +3163,19 @@ class App(ctk.CTk):
         self.events.put({"kind": "mqtt_message", "topic": topic, "payload": payload,
                          "qos": qos, "retain": retain})
 
+    def _on_sub_result(self, topic: str, granted: int) -> None:
+        """The broker answered a SUBSCRIBE - also on the paho thread."""
+        self.events.put({"kind": "sub_result", "topic": topic, "granted": granted})
+
+    def _handle_sub_result(self, topic: str, _granted: int) -> None:
+        """A watch is only really live once the broker has granted its filter,
+        so redraw the ones on this topic with what it actually said."""
+        for watch in self.config_data.watches:
+            if watch.topic == topic:
+                self._update_watch_button(watch.id)
+                if watch.id == self.selected_watch_id:
+                    self._refresh_watch_hint(watch)
+
     def _handle_mqtt_message(self, topic: str, payload: str,
                              qos: int = 0, retain: bool = False) -> None:
         caught_by = self._capture(topic, payload, qos, retain)
@@ -3271,8 +3373,43 @@ class App(ctk.CTk):
 
     def _watch_label(self, watch: "Watch") -> str:
         seen = self.capture_counts.get(watch.id, 0)
-        marker = "●" if watch.enabled else "○"
+        if not watch.enabled:
+            marker = "○"
+        elif self.mqtt.granted_qos(watch.topic) == SUB_REFUSED:
+            marker = "✕"                       # the broker said no
+        else:
+            marker = "●"
         return f"{marker}  {watch.name}" + (f"   {seen}" if seen else "")
+
+    def _refresh_watch_hint(self, watch: "Watch") -> None:
+        """Say what is actually happening to this watch, not just what was asked
+        for - a filter the broker refused looks identical to a quiet one
+        otherwise, and would be waited on for ever."""
+        seen = self.capture_counts.get(watch.id, 0)
+        granted = self.mqtt.granted_qos(watch.topic)
+        colour = ("#868e96", "#868e96")
+
+        if not watch.enabled:
+            text = "Not watching - tick Watching to subscribe"
+        elif granted == SUB_REFUSED:
+            text = "Broker refused this topic - nothing will be caught"
+            colour = ("#e03131", "#ff6b6b")
+        elif not self.mqtt.is_connected:
+            text = "Subscribed once connected"
+        elif granted is None:
+            text = "Asking the broker..."
+        elif seen:
+            text = f"{seen} message(s) caught on this watch"
+            if granted < watch.qos:
+                text += f" - granted QoS {granted}, not {watch.qos}"
+        elif granted < watch.qos:
+            text = (f"Watching at QoS {granted} - the broker would not grant "
+                    f"QoS {watch.qos}")
+            colour = ("#e8590c", "#ffa94d")
+        else:
+            text = "Watching - nothing has arrived yet"
+
+        self.watch_hint.configure(text=text, text_color=colour)
 
     def _update_watch_button(self, watch_id: str) -> None:
         watch = self.config_data.find_watch(watch_id)
@@ -3309,19 +3446,32 @@ class App(ctk.CTk):
 
         self._watch_dirty = False
         self.watch_save_btn.configure(text="Save")
-        seen = self.capture_counts.get(watch.id, 0)
-        self.watch_hint.configure(
-            text=f"{seen} message(s) caught on this watch" if seen
-            else ("Watching - nothing has arrived yet" if watch.enabled
-                  else "Not watching - tick Watching to subscribe"),
-            text_color=("#868e96", "#868e96"))
+        self._refresh_watch_hint(watch)
         self._refresh_watch_list()
 
     def _mark_watch_dirty(self, _event=None) -> None:
         self._watch_dirty = True
         self.watch_save_btn.configure(text="Save *")
 
-    def _read_watch_editor(self) -> "Watch | None":
+    def _mark_watch_dirty_soon(self, _event=None) -> None:
+        """A paste lands after the event fires, so look once it has."""
+        self.after(1, self._mark_watch_dirty)
+
+    def _apply_watch_edit(self, _event=None) -> None:
+        """Save an edited watch on Enter, or on leaving the box.
+
+        Only when something was actually changed - otherwise every click away
+        from the topic box would re-subscribe and drop whatever the current
+        subscription had queued for us.
+        """
+        if not self._watch_dirty or self.selected_watch_id is None:
+            return
+        # str() of a Tk event type is its number, so ask for the name.
+        kind = getattr(_event, "type", None)
+        leaving = getattr(kind, "name", str(kind)) == "FocusOut"
+        self._save_watch(quiet=leaving)
+
+    def _read_watch_editor(self, quiet: bool = False) -> "Watch | None":
         watch = self.config_data.find_watch(self.selected_watch_id)
         if watch is None:
             return None
@@ -3329,7 +3479,11 @@ class App(ctk.CTk):
         topic = self.watch_topic_entry.get().strip()
         problem = topic_filter_error(topic)
         if problem:
-            messagebox.showwarning(APP_NAME, problem, parent=self)
+            # `quiet` is for the saves the user did not press a button for -
+            # clicking away from a half-typed topic should leave it alone, not
+            # put a dialog in front of a window that is being left.
+            if not quiet:
+                messagebox.showwarning(APP_NAME, problem, parent=self)
             return None
 
         return Watch(id=watch.id,
@@ -3338,8 +3492,8 @@ class App(ctk.CTk):
                      qos=int(self.watch_qos_menu.get()),
                      enabled=bool(self.watch_enabled_check.get()))
 
-    def _save_watch(self) -> bool:
-        edited = self._read_watch_editor()
+    def _save_watch(self, quiet: bool = False) -> bool:
+        edited = self._read_watch_editor(quiet)
         if edited is None:
             return False
 
@@ -3426,8 +3580,7 @@ class App(ctk.CTk):
             self.capture_counts[watch.id] = self.capture_counts.get(watch.id, 0) + 1
             self._update_watch_button(watch.id)
             if watch.id == self.selected_watch_id:
-                self.watch_hint.configure(
-                    text=f"{self.capture_counts[watch.id]} message(s) caught on this watch")
+                self._refresh_watch_hint(watch)
         self._feed_append(record)
         return matched
 
@@ -3977,6 +4130,9 @@ class App(ctk.CTk):
         elif kind == "mqtt_message":
             self._handle_mqtt_message(event["topic"], event["payload"],
                                       event.get("qos", 0), event.get("retain", False))
+
+        elif kind == "sub_result":
+            self._handle_sub_result(event["topic"], event["granted"])
 
         elif kind == "started":
             self._set_connection_ui(self.mqtt.is_connected)
