@@ -55,6 +55,7 @@ import csv
 import json
 import os
 import queue
+import re
 import ssl
 import sys
 import threading
@@ -74,7 +75,7 @@ import paho.mqtt.client as mqtt
 # ============================================================================
 
 APP_NAME = "MQTT Trigger"
-APP_VERSION = "2.3.2"
+APP_VERSION = "2.4.0"
 KEYRING_SERVICE = "MQTTTrigger"
 
 # Credential-vault account name for the random key that encrypts the settings
@@ -523,6 +524,19 @@ def parse_trigger(payload: str) -> bool | None:
                 return _coerce_trigger(lowered[key])
         return None
     return _coerce_trigger(data)
+
+
+def _capture_filename(record: "Capture") -> str:
+    """A default filename for one exported message, named after its topic.
+
+    A topic is not a filename - the separators, and the wildcards a watch may
+    carry, are all characters that would either nest the file in directories
+    that do not exist or be refused outright.
+    """
+    safe = re.sub(r"[^A-Za-z0-9]+", "-", record.topic).strip("-")
+    if len(safe) > 60:
+        safe = safe[-60:].lstrip("-")     # the leaf matters more than the root
+    return f"mqtt-message-{record.seq:04d}{'-' + safe if safe else ''}.json"
 
 
 def topic_matches(pattern: str, topic: str) -> bool:
@@ -2400,13 +2414,27 @@ class App(ctk.CTk):
         head = ctk.CTkFrame(right, fg_color="transparent")
         head.grid(row=6, column=0, columnspan=2, padx=16, pady=(0, 2), sticky="ew")
         head.grid_columnconfigure(0, weight=1)
+        # A long topic would otherwise make this row ask for more width than it
+        # has, and grid answers that by shrinking every column - buttons
+        # included. A floor under the button columns puts the shortfall where
+        # it can be absorbed: the label, which trims its own text to suit.
+        head.grid_columnconfigure(1, minsize=116)
+        head.grid_columnconfigure(2, minsize=140)
         self.detail_label = ctk.CTkLabel(
             head, text="Nothing caught yet - click a line above to inspect one.",
             anchor="w", font=ctk.CTkFont(size=12, weight="bold"))
-        self.detail_label.grid(row=0, column=0, sticky="w")
+        # Filled, not hugged: the label has to span the whole column for its
+        # own width to be the budget it trims text to.
+        self.detail_label.grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(head, text="Copy payload", width=110, height=26,
                       fg_color="transparent", border_width=1,
-                      command=self._copy_capture).grid(row=0, column=1)
+                      command=self._copy_capture).grid(row=0, column=1, padx=(0, 6))
+        # This row is about the one message being read, so the export that
+        # writes only that message belongs here - the Export... above the feed
+        # is the one that writes the whole feed.
+        ctk.CTkButton(head, text="Export message...", width=140, height=26,
+                      fg_color="transparent", border_width=1,
+                      command=self._export_one_capture).grid(row=0, column=2)
 
         self.detail_box = ctk.CTkTextbox(
             right, font=ctk.CTkFont(family=MONO_FONT, size=12),
@@ -3699,14 +3727,36 @@ class App(ctk.CTk):
         if line:
             self.feed_box.tag_add("pick", f"{line}.0", f"{line}.end+1c")
 
-        self.detail_label.configure(
-            text=f"{record.topic}     QoS {record.qos}"
-                 + ("   retained" if record.retain else "")
-                 + f"     {record.at}")
+        tail = (f"     QoS {record.qos}"
+                + ("   retained" if record.retain else "")
+                + f"     {record.at}")
+        self.detail_label.configure(text=self._fit_detail(record.topic, tail))
         self.detail_box.configure(state="normal")
         self.detail_box.delete("1.0", "end")
         self.detail_box.insert("1.0", record.pretty())
         self.detail_box.configure(state="disabled")
+
+    def _fit_detail(self, topic: str, tail: str) -> str:
+        """`topic + tail` trimmed to the width the label actually has.
+
+        The tail is the only place QoS, the retain flag and the full timestamp
+        are shown, so it is kept whole and the topic gives way - from the left,
+        because `.../agv1/state` says more about which message this is than the
+        prefix every topic on the broker shares.
+        """
+        full = topic + tail
+        budget = self.detail_label.winfo_width()
+        font = self.detail_label.cget("font")
+        if budget <= 1 or font.measure(full) <= budget:
+            return full                      # fits, or not laid out yet
+
+        room = budget - font.measure("..." + tail)
+        if room <= 0:
+            return "..." + tail
+        trimmed = topic
+        while trimmed and font.measure(trimmed) > room:
+            trimmed = trimmed[1:]
+        return "..." + trimmed + tail
 
     def _on_feed_click(self, event) -> None:
         if not self._feed_rows:
@@ -3754,20 +3804,15 @@ class App(ctk.CTk):
         self.clipboard_append(record.pretty())
         self.status_left.configure(text=f"Payload from {record.topic} copied")
 
-    def _export_captures(self) -> None:
-        rows = [c for c in self.captures if self._feed_shows(c)]
-        if not rows:
-            messagebox.showinfo(APP_NAME, "Nothing caught to export yet.", parent=self)
-            return
-
-        default = f"mqtt-capture-{datetime.now():%Y%m%d-%H%M%S}.json"
-        path = filedialog.asksaveasfilename(
-            parent=self, title="Export caught messages", initialfile=default,
+    def _ask_export_path(self, title: str, default: str) -> str:
+        return filedialog.asksaveasfilename(
+            parent=self, title=title, initialfile=default,
             defaultextension=".json",
             filetypes=[("JSON", "*.json"), ("CSV", "*.csv"), ("All files", "*.*")])
-        if not path:
-            return
 
+    def _write_captures(self, path: str, rows: "list[Capture]") -> bool:
+        """Write `rows` to `path`, as CSV or JSON by extension. False on failure,
+        having already said why."""
         try:
             if path.lower().endswith(".csv"):
                 with open(path, "w", newline="", encoding="utf-8") as handle:
@@ -3784,11 +3829,45 @@ class App(ctk.CTk):
                 }, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"Could not write file:\n{exc}", parent=self)
-            return
+            return False
 
         self.status_left.configure(text=f"{len(rows)} message(s) exported to {path}")
         self.log("activity", "ok",
                  f"Exported {len(rows)} caught message(s) to {path}")
+        return True
+
+    def _export_captures(self) -> None:
+        """Everything the feed is showing - one watch's worth, or all of them."""
+        rows = [c for c in self.captures if self._feed_shows(c)]
+        if not rows:
+            messagebox.showinfo(APP_NAME, "Nothing caught to export yet.", parent=self)
+            return
+
+        path = self._ask_export_path(
+            "Export caught messages",
+            f"mqtt-capture-{datetime.now():%Y%m%d-%H%M%S}.json")
+        if path:
+            self._write_captures(path, rows)
+
+    def _export_one_capture(self) -> None:
+        """Just the message being read.
+
+        Picking a message out of a long session is the common case - one state
+        update to send to somebody, or to keep beside a bug report - and
+        exporting the whole feed to get at it means trimming the file by hand
+        afterwards.
+        """
+        record = self._selected_capture
+        if record is None:
+            messagebox.showinfo(
+                APP_NAME, "Pick a caught message first - click a line in the feed.",
+                parent=self)
+            return
+
+        path = self._ask_export_path("Export this message",
+                                     _capture_filename(record))
+        if path:
+            self._write_captures(path, [record])
 
     def _update_monitor_counts(self) -> None:
         shown = len(self._feed_rows)
