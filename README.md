@@ -26,7 +26,7 @@ which is still here and still works.
 
 ### Windows
 
-Download **`MQTT-Trigger-2.4.0.exe`** from the
+Download **`MQTT-Trigger-2.4.1.exe`** from the
 [Releases page](https://github.com/ApollosRGB/Gradion-MQTT-message-sender/releases)
 and run it. It is a single self-contained file — the machine running it does
 **not** need Python installed.
@@ -40,8 +40,8 @@ Download the **`.dmg`** for your Mac from the
 
 | Your Mac | File |
 |---|---|
-| Apple Silicon (M1/M2/M3/M4) | `MQTT-Trigger-2.4.0-macOS-arm64.dmg` |
-| Intel | `MQTT-Trigger-2.4.0-macOS-x86_64.dmg` |
+| Apple Silicon (M1/M2/M3/M4) | `MQTT-Trigger-2.4.1-macOS-arm64.dmg` |
+| Intel | `MQTT-Trigger-2.4.1-macOS-x86_64.dmg` |
 
 Not sure which you have?  → menu → **About This Mac**. "Apple M…" means Apple
 Silicon.
@@ -383,12 +383,15 @@ back into a single feed when comparing them is the point.
   up from whatever arrives next.
 - **Copy payload** puts the selected payload on the clipboard, formatted the way
   the panel shows it.
-- **Export message…**, beside it, writes **just the message you have selected** —
-  for pulling one state update out of a long session without trimming a file by
-  hand afterwards. The name it offers is built from the topic, so
-  `uagv/v2/mfr/agv1/state` gives `mqtt-message-0042-uagv-v2-mfr-agv1-state.json`.
-- **Export…**, above the feed, writes what the feed currently shows — so the
-  selected watch and the filter both apply.
+- **Export**, above the feed, asks which before it asks where:
+
+  | Choice | Writes |
+  |---|---|
+  | **This message…** | only the message selected in the feed — for pulling one state update out of a long session without trimming a file by hand afterwards |
+  | **Everything in the feed…** | every message the feed is showing, so the selected watch and the filter both apply |
+
+  **This message…** names the file after the topic, so `uagv/v2/mfr/agv1/state`
+  gives `mqtt-message-0042-uagv-v2-mfr-agv1-state.json`.
 
 Both write `.json` (one object per message, with sequence number, timestamp,
 topic, QoS, retain flag and payload) or `.csv` (the same, one row per message);

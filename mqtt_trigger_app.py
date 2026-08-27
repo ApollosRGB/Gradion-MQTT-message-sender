@@ -75,7 +75,7 @@ import paho.mqtt.client as mqtt
 # ============================================================================
 
 APP_NAME = "MQTT Trigger"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.4.1"
 KEYRING_SERVICE = "MQTTTrigger"
 
 # Credential-vault account name for the random key that encrypts the settings
@@ -313,6 +313,11 @@ class SecretStore:
 
 PBKDF2_ROUNDS = 480_000
 PROFILE_MAGIC = b"MQTTTRIGGER-PROFILE-1\n"
+
+# The two things "export" can mean on the Topic monitor. One control offers
+# both rather than two buttons a glance apart both reading "Export...".
+EXPORT_SELECTED = "This message..."
+EXPORT_FEED = "Everything in the feed..."
 
 PROFILE_EXPORT = "Export profile..."
 PROFILE_IMPORT = "Import profile..."
@@ -2400,9 +2405,14 @@ class App(ctk.CTk):
                                                fg_color="transparent", border_width=1,
                                                command=self._toggle_capture_pause)
         self.monitor_pause_btn.grid(row=0, column=3, padx=(0, 6))
-        ctk.CTkButton(tools, text="Export...", width=90, fg_color="transparent",
-                      border_width=1, command=self._export_captures).grid(
-            row=0, column=4)
+        # Two buttons a glance apart, both reading "Export...", are one button
+        # too many - which is which was a coin toss. Ask instead, the way the
+        # Profile menu in the header does.
+        self.export_menu = ctk.CTkOptionMenu(
+            tools, width=115, values=[EXPORT_SELECTED, EXPORT_FEED],
+            command=self._on_export_action)
+        self.export_menu.set("Export")
+        self.export_menu.grid(row=0, column=4)
 
         self.feed_box = ctk.CTkTextbox(
             right, font=ctk.CTkFont(family=MONO_FONT, size=12),
@@ -2418,8 +2428,7 @@ class App(ctk.CTk):
         # has, and grid answers that by shrinking every column - buttons
         # included. A floor under the button columns puts the shortfall where
         # it can be absorbed: the label, which trims its own text to suit.
-        head.grid_columnconfigure(1, minsize=116)
-        head.grid_columnconfigure(2, minsize=140)
+        head.grid_columnconfigure(1, minsize=110)
         self.detail_label = ctk.CTkLabel(
             head, text="Nothing caught yet - click a line above to inspect one.",
             anchor="w", font=ctk.CTkFont(size=12, weight="bold"))
@@ -2428,13 +2437,7 @@ class App(ctk.CTk):
         self.detail_label.grid(row=0, column=0, sticky="ew")
         ctk.CTkButton(head, text="Copy payload", width=110, height=26,
                       fg_color="transparent", border_width=1,
-                      command=self._copy_capture).grid(row=0, column=1, padx=(0, 6))
-        # This row is about the one message being read, so the export that
-        # writes only that message belongs here - the Export... above the feed
-        # is the one that writes the whole feed.
-        ctk.CTkButton(head, text="Export message...", width=140, height=26,
-                      fg_color="transparent", border_width=1,
-                      command=self._export_one_capture).grid(row=0, column=2)
+                      command=self._copy_capture).grid(row=0, column=1)
 
         self.detail_box = ctk.CTkTextbox(
             right, font=ctk.CTkFont(family=MONO_FONT, size=12),
@@ -3835,6 +3838,15 @@ class App(ctk.CTk):
         self.log("activity", "ok",
                  f"Exported {len(rows)} caught message(s) to {path}")
         return True
+
+    def _on_export_action(self, choice: str) -> None:
+        # Put the word back: this is an action menu, not a setting, so it
+        # should not sit there afterwards claiming to be a state.
+        self.export_menu.set("Export")
+        if choice == EXPORT_SELECTED:
+            self._export_one_capture()
+        elif choice == EXPORT_FEED:
+            self._export_captures()
 
     def _export_captures(self) -> None:
         """Everything the feed is showing - one watch's worth, or all of them."""
